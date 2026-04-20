@@ -140,7 +140,7 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
         for dataset_name in datasets:
             print(f"\n" + "="*60 + f"\n🚀 启动严格 Test 评测: {target_model} | {dataset_name}\n" + "="*60)
             
-            exp_dir = os.path.join(project_root, "experiments", target_model, f"{dataset_name}_100samples")
+            exp_dir = os.path.join(project_root, "experiments", target_model, f"{dataset_name}_10000samples")
             os.makedirs(exp_dir, exist_ok=True)
             
             base_meta_path = os.path.join(exp_dir, "03_final_scored_metadata.jsonl")
