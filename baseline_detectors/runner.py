@@ -306,8 +306,20 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
 
 if __name__ == "__main__":
     run_benchmark(
-        target_models=["meta-llama/Llama-3.2-3B-Instruct"],
-        datasets=["belebele"],
+        target_models=["meta-llama/Llama-3.1-8B-Instruct"],
+        datasets=[
+            "truthful_qa",
+            "halueval_qa",
+            "trivia_qa",
+            "coqa",
+            "squad_v2",
+            "arc_challenge",
+            "xsum",
+            "gsm8k",
+            "human_eval",
+            "xlam_agent",
+            "mbpp"
+        ],
         baselines=[
             "selfcheck_bertscore",
             "selfcheck_nli",
@@ -321,7 +333,7 @@ if __name__ == "__main__":
             "ccs",
             "prism",
             "saplma",
-            "icr_probe",
-            "sep"
+            "sep",
+            "icr_probe", ### 这一个如果太慢你可以先注释了，我优化完再跑
         ] 
     )
