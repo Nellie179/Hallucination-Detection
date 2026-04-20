@@ -10,7 +10,7 @@ from tqdm import tqdm
 # 🎯 环境注入：挂载数据模块 (完美修复路径迷失)
 # ==========================================
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-data_dir = os.path.join(project_root, "data")
+data_dir = os.path.join(project_root, "datasets_v1")
 utils_dir = os.path.join(project_root, "data_utils")
 
 if project_root not in sys.path: sys.path.insert(0, project_root)
@@ -18,7 +18,7 @@ if data_dir not in sys.path: sys.path.insert(0, data_dir)
 if utils_dir not in sys.path: sys.path.insert(0, utils_dir)
 
 # 纯净导入
-from data.generate_stochastic_samples import StochasticExtractor
+from datasets_v1.generate_stochastic_samples import StochasticExtractor
 from data_utils.accessor import SampleAccessor
 from baseline_detectors.evaluators.classification import ClassificationEvaluator
 from data_utils.extract_qa_hidden_states import process_dataset
@@ -28,7 +28,7 @@ from data_utils.data_split import split_dataset
 # 💎 评测全局配置中枢
 # ==========================================
 EVAL_CONFIG = {
-    "num_samples": 5,
+    "num_samples": 3,
     "max_new_tokens": 256,
     "system_prompt": "You are a helpful, accurate, and honest AI assistant.",
     "num_shots": 4, 
