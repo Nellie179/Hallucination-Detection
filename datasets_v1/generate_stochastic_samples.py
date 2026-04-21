@@ -8,6 +8,7 @@ import math  # 🚨 必须导入，用于处理下溢的底层保护
 import ml_dtypes
 import multiprocessing as mp
 from typing import Dict, Any, List
+from tqdm import tqdm
 
 # 🎯 纯正的邻居法则引入
 from hidden_state import HiddenStateExtractor
@@ -214,16 +215,17 @@ class StochasticExtractor(HiddenStateExtractor):
 
         processed_count = 0
         try:
-            for item in dataset_items:
+            pbar = tqdm(dataset_items, desc=f"Stochastic sampling (n_samples={num_samples})", unit="prompt")
+            for item in pbar:
                 sample_id = item["sample_id"]
-                print(f"[Main] 多次采样推理中: {sample_id}...")
+                pbar.set_postfix_str(f"sid={sample_id}", refresh=False)
 
                 # 构建完全相同的 Prompt
                 prompt_str = prompt_builder.build_prompt(
                     target_item=item,
                     few_shot_pool=dataset_items
                 )
-                
+
                 # 获取 num_samples 次串行生成结果
                 batch_results = self.generate_and_extract_stochastic(
                     prompt_str, layer_config, token_config, max_new_tokens, num_samples, generation_kwargs,

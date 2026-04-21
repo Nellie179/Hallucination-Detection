@@ -2,6 +2,7 @@ import os
 import json
 import torch
 from typing import List, Dict, Any
+from tqdm import tqdm
 
 # 和你当前 stochastic 脚本保持一致的依赖风格
 from hidden_state import HiddenStateExtractor
@@ -110,14 +111,15 @@ class AuxiliaryEvaluator(HiddenStateExtractor):
 
         try:
             with open(output_jsonl_path, mode, encoding="utf-8") as f_out:
-                for item in dataset_items:
+                pbar = tqdm(dataset_items, desc="Auxiliary eval", unit="prompt")
+                for item in pbar:
                     sample_id = str(item["sample_id"])
 
                     if sample_id in existing_ids:
                         skipped_count += 1
                         continue
 
-                    print(f"[Main] Auxiliary 生成中: {sample_id}...")
+                    pbar.set_postfix_str(f"sid={sample_id}", refresh=False)
 
                     # 和你当前 stochastic 流程保持一致：用同一个 PromptBuilder 还原主 prompt
                     prompt_str = prompt_builder.build_prompt(
