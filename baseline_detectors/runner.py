@@ -373,8 +373,8 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
 
 if __name__ == "__main__":
     run_benchmark(
-        target_models=["meta-llama/Llama-3.2-3B-Instruct"],
-        datasets=[ "belebele"
+        target_models=["meta-llama/Llama-3.1-8B-Instruct"],
+        datasets=[
             # "truthful_qa",
             # "halueval_qa",
             # "trivia_qa",
@@ -388,21 +388,21 @@ if __name__ == "__main__":
             # "mbpp"
         ],
         baselines=[
-            # "selfcheck_bertscore",
-            # "selfcheck_nli",
+            "selfcheck_bertscore",
+            "selfcheck_nli",
             "semantic_entropy",
-            # "lexical_similarity",
-            #  "verbalize",
-            # "self_evaluator",
-            # "perplexity",
-            # "ln_entropy",
-            # "eigenscore_internal",
-            # "ccs",
-            # "prism",
-            # "saplma",
+            "lexical_similarity",
+             "verbalize",
+            "self_evaluator",
+            "perplexity",
+            "ln_entropy",
+            "eigenscore_internal",
+            "ccs",
+            "prism",
+            "saplma",
             "sep",
-            # "icr_probe",
-            # "mind",
+            "icr_probe",
+            "mind",
             "sar"
         ] 
     )
