@@ -31,11 +31,13 @@ class QAHiddenStateExtractor:
         model_kwargs: dict = None,
         method: str = None,
         model = None,       # 👈 [注入入口]
-        tokenizer = None    # 👈 [注入入口]
+        tokenizer = None,    # 👈 [注入入口]
+        pooling: str = "mean"   # 🚀 [新增]: 开放池化策略选择，默认为 mean
     ):
         self.method = method
         self.model_name = model_name
         self.model_kwargs = (model_kwargs or {}).copy()
+        self.pooling = pooling
 
         # ==============================================================================
         # 🚀 依赖注入逻辑：如果传了模型，直接白嫖，绝对不读硬盘
@@ -212,7 +214,14 @@ class QAHiddenStateExtractor:
                 hs_res[l_idx] = all_layer_hs[-1, :].cpu().float().numpy().astype(np.float16)
             else:
                 ans_hs = all_layer_hs[prompt_len:, :]
-                hs_res[l_idx] = ans_hs.mean(dim=0).cpu().float().numpy().astype(np.float16)
+                if self.pooling == "last":
+                    # 取回答的最后一个 Token
+                    target_hs = ans_hs[-1, :]
+                else:
+                    # 默认: 取回答所有 Token 的均值
+                    target_hs = ans_hs.mean(dim=0)
+                
+                hs_res[l_idx] = target_hs.cpu().float().numpy().astype(np.float16)
             
             if method == "icr_probe":
                 tw_res[l_idx] = ans_hs.cpu().float().numpy().astype(np.float16)
@@ -232,7 +241,7 @@ class QAHiddenStateExtractor:
         }
 
 # 🚀 增加 model 和 tokenizer 参数注入通道
-def process_dataset(input_jsonl, output_h5, model_name, method, model_kwargs=None, max_samples=None, model=None, tokenizer=None):
+def process_dataset(input_jsonl, output_h5, model_name, method, model_kwargs=None, max_samples=None, model=None, tokenizer=None, pooling="mean"):
     print(f"\n{'='*70}\n🚀 启动 QA 拼接特征提取器 ({method.upper()})\n{'='*70}")
     
     # 将模型实例传给提取器
@@ -241,7 +250,8 @@ def process_dataset(input_jsonl, output_h5, model_name, method, model_kwargs=Non
         model_kwargs=model_kwargs, 
         method=method,
         model=model,          # 👈 [注入]
-        tokenizer=tokenizer   # 👈 [注入]
+        tokenizer=tokenizer,   # 👈 [注入]
+        pooling=pooling
     )
 
     samples = []

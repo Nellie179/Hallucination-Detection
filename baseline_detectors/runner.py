@@ -75,8 +75,8 @@ EVAL_CONFIG = {
     
     # 🎯 核心开关：当前使用【极速模式】跑分
     "stochastic_gen_kwargs": FAST_KWARGS, 
-    
-    "template_kwargs": {"enable_thinking": False},
+    "pooling_method": "mean",  ## choose from "mean" or "last"
+    "template_kwargs": {"enable_thinking": False}, ## Turning to False when using Qwen, others keep in True
     "model_kwargs": {"trust_remote_code": True}
 }
 
@@ -325,13 +325,13 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
             if need_logprobs and not os.path.exists(recovery_h5_path):
                 print(f"\n[*] 启动 'base_logit_recovery' 独立补票...")
                 m, t = get_sdpa_model()  # 👈 触发 SDPA 加载
-                process_dataset(input_jsonl=base_meta_path, output_h5=recovery_h5_path, model_name=target_model, method="base_logit_recovery", model_kwargs=EVAL_CONFIG["model_kwargs"], model=m, tokenizer=t)
+                process_dataset(input_jsonl=base_meta_path, output_h5=recovery_h5_path, model_name=target_model, method="base_logit_recovery", model_kwargs=EVAL_CONFIG["model_kwargs"], model=m, tokenizer=t, pooling=EVAL_CONFIG.get("pooling_method", "mean"))
                 torch.cuda.empty_cache()
 
             # 【1.6】SDPA 适用的探测器提取
             for det in active_detectors:
                 # 排除 saplma 和 icr_probe
-                if getattr(det, "requires_qa_features", False) and det.name not in ["saplma", "icr_probe"]:
+                if getattr(det, "requires_qa_features", False) and det.name not in ["saplma", "icr_probe", "haloscope"]:
                     qa_path = os.path.join(exp_dir, f"05_qa_features_{det.name}.h5")
                     need_extract = False
                     if not os.path.exists(qa_path):
@@ -358,7 +358,7 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
                     if need_extract:
                         print(f"\n[*] 启动 {det.name} 专属特征提取引擎...")
                         m, t = get_sdpa_model()  # 👈 触发 SDPA 加载
-                        process_dataset(input_jsonl=base_meta_path, output_h5=qa_path, model_name=target_model, method=det.name, model_kwargs=EVAL_CONFIG["model_kwargs"], model=m, tokenizer=t)
+                        process_dataset(input_jsonl=base_meta_path, output_h5=qa_path, model_name=target_model, method=det.name, model_kwargs=EVAL_CONFIG["model_kwargs"], model=m, tokenizer=t, pooling=EVAL_CONFIG.get("pooling_method", "mean"))
                         torch.cuda.empty_cache()
 
             # 🧹 [清洗 SDPA 显存]
@@ -396,7 +396,7 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
                     if need_extract:
                         print(f"\n[*] 启动 {det.name} 专属特征提取引擎 (Eager 模式)...")
                         m, t = get_eager_model()  # 👈 触发 EAGER 加载
-                        process_dataset(input_jsonl=base_meta_path, output_h5=qa_path, model_name=target_model, method=det.name, model_kwargs=EVAL_CONFIG["model_kwargs"], model=m, tokenizer=t)
+                        process_dataset(input_jsonl=base_meta_path, output_h5=qa_path, model_name=target_model, method=det.name, model_kwargs=EVAL_CONFIG["model_kwargs"], model=m, tokenizer=t, pooling=EVAL_CONFIG.get("pooling_method", "mean"))
                         torch.cuda.empty_cache()
 
             # 🧹 [清洗 Eager 显存]
@@ -442,8 +442,8 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
             qa_h5_handles = {}
             for det in active_detectors:
                 if getattr(det, "requires_qa_features", False):
-                    if det.name == "saplma":
-                        qa_h5_handles["saplma"] = h5py.File(recovery_h5_path, 'r')
+                    if det.name in ["saplma", "haloscope"]:
+                        qa_h5_handles[det.name] = h5py.File(recovery_h5_path, 'r')
                         continue
                     qa_path = os.path.join(exp_dir, f"05_qa_features_{det.name}.h5")
                     if os.path.exists(qa_path): qa_h5_handles[det.name] = h5py.File(qa_path, 'r')
@@ -462,7 +462,7 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
                     target_h5 = qa_h5_handles.get(detector.name)
                     for acc in train_accessors + test_accessors:
                         acc.qa_h5_file = target_h5
-                        acc.method_type = detector.name 
+                        acc.method_type = "base_logit_recovery" if detector.name in ["saplma", "haloscope"] else detector.name
                 
                 detector.fit(train_accessors)
                 for acc in tqdm(test_accessors, desc="Scoring on Test Set", leave=False):
@@ -495,6 +495,7 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
                 if h: h.close()
 
 if __name__ == "__main__":
+    set_global_seed(42)
     run_benchmark(
         target_models=["meta-llama/Llama-3.2-3B-Instruct"],
         datasets=["belebele"
