@@ -112,6 +112,94 @@ class QAHiddenStateExtractor:
 
         return nested_hs, nested_att
 
+    def extract_features_batch(
+        self,
+        prompts: List[str],
+        answers: List[str],
+        method: str,
+    ) -> List[Dict[str, Any]]:
+        """Batched forward pass for the default Q+A concat branch of extract_features.
+
+        Only supports methods that go through the generic P+A concat path — namely
+        everything except 'prism', 'self_evaluator', 'icr_probe', 'sep', which have
+        special tokenization or feature-extraction logic handled per-sample upstream.
+
+        Uses RIGHT-padding under causal attention: real tokens never attend to pads,
+        so per-row hidden states are identical to the single-sample forward pass up
+        to GEMM non-associativity (≤1e-4 drift in bf16).
+        """
+        assert method not in ("prism", "self_evaluator", "icr_probe", "sep"), (
+            f"extract_features_batch does not support method={method!r}; use extract_features"
+        )
+
+        B = len(prompts)
+        full_ids_list: List[torch.Tensor] = []
+        prompt_lens: List[int] = []
+        real_lens: List[int] = []
+        for p, a in zip(prompts, answers):
+            p_ids = self.tokenizer(p, return_tensors="pt", add_special_tokens=True).input_ids[0]
+            a_ids = self.tokenizer(a, return_tensors="pt", add_special_tokens=False).input_ids[0]
+            full_ids = torch.cat([p_ids, a_ids], dim=0)
+            full_ids_list.append(full_ids)
+            prompt_lens.append(int(p_ids.shape[0]))
+            real_lens.append(int(full_ids.shape[0]))
+
+        max_len = max(real_lens)
+        pad_id = self.tokenizer.pad_token_id
+        padded_ids = torch.full((B, max_len), pad_id, dtype=torch.long)
+        padded_mask = torch.zeros((B, max_len), dtype=torch.long)
+        for i, t in enumerate(full_ids_list):
+            padded_ids[i, : real_lens[i]] = t
+            padded_mask[i, : real_lens[i]] = 1
+
+        padded_ids = padded_ids.to(self.device)
+        padded_mask = padded_mask.to(self.device)
+
+        with torch.inference_mode():
+            outputs = self.model(
+                input_ids=padded_ids,
+                attention_mask=padded_mask,
+                output_hidden_states=True,
+            )
+            logits = outputs.logits
+
+        target_layers = list(range(self.total_layers))
+        results: List[Dict[str, Any]] = []
+        for b in range(B):
+            real_len = real_lens[b]
+            plen = prompt_lens[b]
+
+            shift_logits = logits[b, : real_len - 1, :]
+            shift_labels = padded_ids[b, 1:real_len]
+            log_probs_full = torch.nn.functional.log_softmax(shift_logits, dim=-1)
+            target_logprobs = torch.gather(
+                log_probs_full, index=shift_labels.unsqueeze(-1), dim=-1
+            ).squeeze(-1)
+            start_idx = max(0, plen - 1)
+            ans_lps = target_logprobs[start_idx:].cpu().float().numpy().astype(np.float16)
+
+            hs_res: Dict[int, np.ndarray] = {}
+            for l_idx in target_layers:
+                hf_l_idx = l_idx + 1
+                all_layer_hs = outputs.hidden_states[hf_l_idx][b]
+                ans_hs = all_layer_hs[plen:real_len, :]
+                if self.pooling == "last":
+                    target_hs = ans_hs[-1, :]
+                else:
+                    target_hs = ans_hs.mean(dim=0)
+                hs_res[l_idx] = target_hs.cpu().float().numpy().astype(np.float16)
+
+            results.append({
+                "logprobs": ans_lps,
+                "hidden_states": hs_res,
+                "token_wise": None,
+                "icr_feature": None,
+                "sep_features": None,
+            })
+
+        del outputs, logits
+        return results
+
     def extract_features(
         self,
         prompt: str,
@@ -144,7 +232,7 @@ class QAHiddenStateExtractor:
             seq_len = full_ids.shape[1]
 
         need_attn = (method == "icr_probe")
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = self.model(
                 input_ids=full_ids,
                 attention_mask=full_mask,
@@ -232,6 +320,25 @@ class QAHiddenStateExtractor:
         }
 
 
+_BATCHABLE_METHODS = {"base_logit_recovery", "saplma", "haloscope", "mind"}
+
+
+def _write_default_h5_group(f_h5, sid: str, method: str, res: Dict[str, Any]):
+    g_name = f"{sid}_{method}"
+    if g_name in f_h5:
+        del f_h5[g_name]
+    grp = f_h5.create_group(g_name)
+    grp.create_dataset("logprobs", data=res["logprobs"])
+    for l, d in res["hidden_states"].items():
+        grp.create_dataset(f"layer_{l}", data=d)
+
+
+def _log_sample_failure(output_h5: str, sid: str, exc: Exception):
+    error_log_path = output_h5 + ".failed_ids.txt"
+    with open(error_log_path, 'a', encoding='utf-8') as f_err:
+        f_err.write(f"{sid}\t{exc}\n")
+
+
 def process_dataset(
     input_jsonl,
     output_h5,
@@ -259,7 +366,71 @@ def process_dataset(
             if max_samples and len(samples) >= max_samples:
                 break
 
+    use_batched = method in _BATCHABLE_METHODS
+    batch_size = max(1, int(os.getenv("QA_BATCH", "2")))
+
     with h5py.File(output_h5, 'a') as f_h5:
+        if use_batched and batch_size > 1:
+            pending = []
+            for sample in samples:
+                sid = str(sample.get("sample_id"))
+                p, a = sample.get("prompt", ""), sample.get("model_output_text", "")
+                if not p or not a:
+                    continue
+                if f"{sid}_{method}" in f_h5:
+                    continue
+                pending.append((sid, p, a))
+
+            logger.info(
+                f"[{method}] batched QA extraction: {len(pending)} pending, batch_size={batch_size}"
+            )
+
+            def _run_single(sid, p, a):
+                try:
+                    res = extractor.extract_features(p, a, method)
+                    _write_default_h5_group(f_h5, sid, method, res)
+                except Exception as e2:
+                    logger.warning(f"sample {sid} extraction failed (single-sample fallback): {e2}")
+                    if f"{sid}_{method}" in f_h5:
+                        del f_h5[f"{sid}_{method}"]
+                    _log_sample_failure(output_h5, sid, e2)
+                    if "out of memory" in str(e2).lower():
+                        torch.cuda.empty_cache()
+
+            pbar = tqdm(range(0, len(pending), batch_size), desc=f"Inference: {method} (batch={batch_size})")
+            for i in pbar:
+                chunk = pending[i : i + batch_size]
+                sids = [x[0] for x in chunk]
+                prompts = [x[1] for x in chunk]
+                answers = [x[2] for x in chunk]
+
+                try:
+                    batch_results = extractor.extract_features_batch(prompts, answers, method)
+                    for (sid, _, _), res in zip(chunk, batch_results):
+                        try:
+                            _write_default_h5_group(f_h5, sid, method, res)
+                        except Exception as ewrite:
+                            logger.warning(f"H5 write failed for {sid}: {ewrite}")
+                            _log_sample_failure(output_h5, sid, ewrite)
+                    f_h5.flush()
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    if "out of memory" in error_msg or "oom" in error_msg:
+                        logger.warning(
+                            f"OOM on batch starting {sids[0]} (size={len(chunk)}) — clearing cache and falling back to single-sample"
+                        )
+                        torch.cuda.empty_cache()
+                        for sid, p, a in chunk:
+                            _run_single(sid, p, a)
+                        f_h5.flush()
+                        torch.cuda.empty_cache()
+                    else:
+                        logger.warning(f"batch extraction failed for {sids}: {e}")
+                        for sid, p, a in chunk:
+                            _run_single(sid, p, a)
+                        f_h5.flush()
+            return
+
         for sample in tqdm(samples, desc=f"Inference: {method}"):
             sid = str(sample.get("sample_id"))
             p, a = sample.get("prompt", ""), sample.get("model_output_text", "")
@@ -322,9 +493,7 @@ def process_dataset(
                     f_h5.flush()
 
                 # 死信队列 (DLQ)：失败的 ID 写入日志
-                error_log_path = output_h5 + ".failed_ids.txt"
-                with open(error_log_path, 'a', encoding='utf-8') as f_err:
-                    f_err.write(f"{sid}\t{e}\n")
+                _log_sample_failure(output_h5, sid, e)
 
                 # OOM 显存急救
                 if "out of memory" in error_msg or "oom" in error_msg:

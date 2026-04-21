@@ -68,8 +68,8 @@ class StochasticExtractor(HiddenStateExtractor):
     专注于多次并发采样与 hidden-state 提取，并封装了全流程。
     """
     
-    def generate_and_extract_stochastic(self, prompt, layer_config, token_config, max_new_tokens, num_samples, generation_kwargs=None):
-        target_layers = self._resolve_target_layers(layer_config)
+    def generate_and_extract_stochastic(self, prompt, layer_config, token_config, max_new_tokens, num_samples, generation_kwargs=None, extract_stochastic_hs: bool = True):
+        target_layers = self._resolve_target_layers(layer_config) if extract_stochastic_hs else []
         gen_kwargs = generation_kwargs or {}
 
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
@@ -83,7 +83,7 @@ class StochasticExtractor(HiddenStateExtractor):
         # 🎯 严谨对齐原论文：Multinomial Beam Sampling (支持 num_beams > 1)
         # =========================================================================
         for i in range(num_samples):
-            with torch.no_grad():
+            with torch.inference_mode():
                 final_gen_kwargs = {
                     **gen_kwargs,                        # 接受外部传入的 num_beams=5 和 do_sample=True
                     "input_ids": input_ids,
@@ -91,7 +91,7 @@ class StochasticExtractor(HiddenStateExtractor):
                     "max_new_tokens": max_new_tokens,
                     "num_return_sequences": 1,           # 强制每次只生成 1 条以防止 KV Cache OOM！
                     "return_dict_in_generate": True,
-                    "output_hidden_states": True,
+                    "output_hidden_states": extract_stochastic_hs,
                     "output_scores": True,
                     "pad_token_id": self.tokenizer.pad_token_id,
                 }
@@ -125,50 +125,50 @@ class StochasticExtractor(HiddenStateExtractor):
                         val = -15.0  # 提供一个极小的合理概率兜底
                     token_logprobs.append(round(val, 4))
 
-            target_indices = self._resolve_target_tokens(total_generated, token_config)
             filtered_tokens_data = []
 
-            if target_indices:
-                layer_tensors = []
-                for l in target_layers:
-                    hf_layer_idx = l + 1
-                    step_tensors = []
-                    for step in target_indices:
-                        seq_idx = -1 if step == 0 else 0
-                        # 🎯 索引固定取 0
-                        step_tensors.append(outputs.hidden_states[step][hf_layer_idx][0, seq_idx, :])
-                    layer_tensors.append(torch.stack(step_tensors))
+            if extract_stochastic_hs:
+                target_indices = self._resolve_target_tokens(total_generated, token_config)
+                if target_indices:
+                    layer_tensors = []
+                    for l in target_layers:
+                        hf_layer_idx = l + 1
+                        step_tensors = []
+                        for step in target_indices:
+                            seq_idx = -1 if step == 0 else 0
+                            # 🎯 索引固定取 0
+                            step_tensors.append(outputs.hidden_states[step][hf_layer_idx][0, seq_idx, :])
+                        layer_tensors.append(torch.stack(step_tensors))
 
-                mega_tensor_gpu = torch.stack(layer_tensors)
-                # 完美继承：优雅的 bfloat16 转换
-                mega_tensor_cpu = mega_tensor_gpu.cpu().float().numpy().astype(ml_dtypes.bfloat16)
+                    mega_tensor_gpu = torch.stack(layer_tensors)
+                    # 完美继承：优雅的 bfloat16 转换
+                    mega_tensor_cpu = mega_tensor_gpu.cpu().float().numpy().astype(ml_dtypes.bfloat16)
 
-                for idx_enum, step in enumerate(target_indices):
-                    token_id = valid_tokens[step].item()
-                    token_str = self.tokenizer.decode([token_id])
+                    for idx_enum, step in enumerate(target_indices):
+                        token_id = valid_tokens[step].item()
+                        token_str = self.tokenizer.decode([token_id])
 
-                    step_states = {}
-                    for j, l in enumerate(target_layers):
-                        step_states[f"layer_{l:02d}"] = mega_tensor_cpu[j, idx_enum, :]
+                        step_states = {}
+                        for j, l in enumerate(target_layers):
+                            step_states[f"layer_{l:02d}"] = mega_tensor_cpu[j, idx_enum, :]
 
-                    filtered_tokens_data.append({
-                        "token_id": token_id,
-                        "token_str": token_str,
-                        "forward_idx": step,
-                        "backward_idx": step - total_generated,
-                        "states": step_states
-                    })
+                        filtered_tokens_data.append({
+                            "token_id": token_id,
+                            "token_str": token_str,
+                            "forward_idx": step,
+                            "backward_idx": step - total_generated,
+                            "states": step_states
+                        })
 
             batch_results.append({
                 "text": full_output_text,
                 "seq_logprob": round(sum(token_logprobs), 4) if token_logprobs else 0.0,
                 "filtered_tokens_data": filtered_tokens_data
             })
-            
-            # 🎯 致命一击：每次循环结束，强制释放本次产生的庞大计算图和 KV Cache！
-            del outputs, transition_scores
-            torch.cuda.empty_cache()
 
+            del outputs, transition_scores
+
+        torch.cuda.empty_cache()
         return batch_results
 
     def process_stochastic_from_file(
@@ -226,7 +226,8 @@ class StochasticExtractor(HiddenStateExtractor):
                 
                 # 获取 num_samples 次串行生成结果
                 batch_results = self.generate_and_extract_stochastic(
-                    prompt_str, layer_config, token_config, max_new_tokens, num_samples, generation_kwargs
+                    prompt_str, layer_config, token_config, max_new_tokens, num_samples, generation_kwargs,
+                    extract_stochastic_hs=extract_stochastic_hs,
                 )
 
                 meta_item = item.copy()

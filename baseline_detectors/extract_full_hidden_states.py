@@ -129,7 +129,7 @@ class HiddenStatesExtractor:
         attention_mask = full_tokens['attention_mask'].to(self.device)
 
         # 提取hidden states
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,

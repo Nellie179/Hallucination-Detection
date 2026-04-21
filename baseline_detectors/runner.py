@@ -8,6 +8,10 @@ import logging
 import time
 from tqdm import tqdm
 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+torch.set_float32_matmul_precision("high")
+
 _log_level = os.getenv("RUNNER_LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, _log_level, logging.INFO),

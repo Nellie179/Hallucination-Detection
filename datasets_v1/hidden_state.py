@@ -120,7 +120,7 @@ class HiddenStateExtractor:
         attention_mask = inputs.attention_mask
         prompt_len = input_ids.shape[1]
 
-        with torch.no_grad():
+        with torch.inference_mode():
             final_gen_kwargs = {
                 **gen_kwargs,
                 "input_ids": input_ids,
