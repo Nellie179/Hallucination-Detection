@@ -97,34 +97,50 @@ class SelfCheckNLIDetector(BaseDetector):
         if self.nli_pipeline is None or self.nlp is None:
             self._load_dependencies()
 
-        main_text = accessor.metadata.get("model_output_text", "")
+        # 1. 获取基础数据
+        main_text = accessor.metadata.get("model_output_text", "").strip()
         stochastic_data = accessor.stochastic_samples_dict.get(accessor.sample_id, {})
-        
-        samples = []
-        if isinstance(stochastic_data, dict):
-            samples = stochastic_data.get("samples", [])
-        elif isinstance(stochastic_data, list):
-            samples = stochastic_data
-
+        samples = stochastic_data.get("samples", []) if isinstance(stochastic_data, dict) else stochastic_data
         valid_samples = [s for s in samples if s and s.strip()]
 
         if not main_text or not valid_samples:
             return float('nan')
 
+        # 2. 🚀 [核心兼容逻辑]: 智能映射器
+        # 尝试从元数据中获取选项（仅多选题型会有此字段）
+        choices = accessor.metadata.get("structured_data", {}).get("choices", {})
+
+        def smart_expand(text):
+            """
+            智能展开函数：
+            - 如果 text 是选项字母 (如 'A') 且在 choices 字典中 -> 映射为完整文本
+            - 否则 (如文本问答 'The weather is cold') -> 原样返回，不进行任何处理
+            """
+            clean_text = text.strip().upper()
+            # 兼容逻辑：长度短且在选项键值中
+            if len(clean_text) <= 2 and clean_text in choices:
+                return f"The answer is {choices[clean_text]}"
+            return text
+
         try:
-            # 2. 对主回答分句 (使用 Spacy 保证质量)
-            sentences = [sent.text.strip() for sent in self.nlp(main_text).sents]
+            # 3. 对主回答应用智能展开
+            expanded_main = smart_expand(main_text)
+            
+            # 4. 对主回答分句 (使用 Spacy)
+            sentences = [sent.text.strip() for sent in self.nlp(expanded_main).sents]
             sentences = [sent for sent in sentences if len(sent) > 0]
             if not sentences:
                 return float('nan')
 
-            # 3. 构建 NLI 验证对：(Premise=采样文本, Hypothesis=主回答的一个句子)
+            # 5. 构建 NLI 验证对
             pairs = []
-            pair_indices = [] # 记录 (sentence_idx, sample_idx)
+            pair_indices = []
             
             for s_idx, sentence in enumerate(sentences):
                 for samp_idx, sample in enumerate(valid_samples):
-                    pairs.append({"text": sample, "text_pair": sentence})
+                    # 🚀 [核心兼容逻辑]: 采样样本也应用智能展开
+                    expanded_sample = smart_expand(sample)
+                    pairs.append({"text": expanded_sample, "text_pair": sentence})
                     pair_indices.append((s_idx, samp_idx))
 
             # 4. 批量推理
