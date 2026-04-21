@@ -4,7 +4,20 @@ import json
 import h5py
 import torch
 import math
+import logging
+import time
 from tqdm import tqdm
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("runner.log", encoding="utf-8"),
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # ==========================================
 # 🎯 环境注入：挂载数据模块 (完美修复路径迷失)
@@ -157,51 +170,59 @@ def build_accessors(jsonl_path, base_h5, st_dict, st_h5, recovery_dict, aux_dict
     return accessors
 
 def run_benchmark(target_models: list, datasets: list, baselines: list):
+    logger.info(f"Initializing {len(baselines)} detectors: {baselines}")
     active_detectors = [get_detector(name) for name in baselines]
-    
+
     need_stochastic = any(getattr(d, "requires_stochastic", False) for d in active_detectors)
     need_stochastic_hs = any(getattr(d, "requires_stochastic_hidden_states", False) for d in active_detectors)
     need_aux_eval = any(name in ["verbalize", "self_evaluator"] for name in baselines)
     need_logprobs = any(getattr(d, "requires_logprobs", False) for d in active_detectors)
+    logger.info(f"Detector requirements — stochastic={need_stochastic}, stochastic_hs={need_stochastic_hs}, aux_eval={need_aux_eval}, logprobs={need_logprobs}")
 
     for target_model in target_models:
         for dataset_name in datasets:
-            print(f"\n" + "="*60 + f"\n🚀 启动严格 Test 评测: {target_model} | {dataset_name}\n" + "="*60)
-            
+            benchmark_start = time.time()
+            logger.info("=" * 60)
+            logger.info(f"START benchmark: model={target_model}  dataset={dataset_name}")
+            logger.info("=" * 60)
+
             exp_dir = os.path.join(project_root, "experiments", target_model, f"{dataset_name}_10000samples")
             os.makedirs(exp_dir, exist_ok=True)
-            
+            logger.info(f"Experiment dir: {exp_dir}")
+
             base_meta_path = os.path.join(exp_dir, "03_final_scored_metadata.jsonl")
             train_meta_path = os.path.join(exp_dir, "03_train.jsonl")
             test_meta_path = os.path.join(exp_dir, "03_test.jsonl")
-            
+
             if not os.path.exists(train_meta_path) or not os.path.exists(test_meta_path):
-                print(f"\n[*] 检测到缺失数据集切分文件，大管家正在自动执行 Train/Val/Test 严格切分...")
+                logger.info("Train/test split files missing — running split now...")
                 split_dataset(input_jsonl=base_meta_path, exp_dir=exp_dir)
-                print(f"[+] 数据集切分完成！\n")
+                logger.info("Dataset split complete.")
 
             st_jsonl_path = os.path.join(exp_dir, "04_stochastic_samples.jsonl")
             st_h5_path = os.path.join(exp_dir, "04_stochastic_hidden_states.h5")
             aux_jsonl_path = os.path.join(exp_dir, "04_auxiliary_evals.jsonl")
             base_h5_path = os.path.join(exp_dir, "02_hidden_states.h5")
-            recovery_h5_path = os.path.join(exp_dir, "05_qa_features_base_logit_recovery.h5") 
+            recovery_h5_path = os.path.join(exp_dir, "05_qa_features_base_logit_recovery.h5")
             final_report_path = os.path.join(exp_dir, "06_evaluation_results.json")
 
             with open(base_meta_path, 'r', encoding='utf-8') as f_meta:
                 expected_total = sum(1 for _ in f_meta)
+            logger.info(f"Total samples in base metadata: {expected_total}")
 
-            # 【阶段 1】采样引擎（只服务真正需要多次采样的方法）
+            # Phase 1 — stochastic sampling
             if need_stochastic:
-                print(f"[*] 执行阶段 1 缓存完整性校验...")
+                logger.info("[Phase 1] Validating stochastic sample cache...")
                 is_cache_valid = validate_stochastic_cache(st_jsonl_path, active_detectors, expected_total)
-                
+
                 if not is_cache_valid:
-                    print(f"[!] 校验未通过：即将启动高级采样引擎进行全量重构...")
+                    logger.warning("Stochastic cache invalid — regenerating from scratch...")
                     for dirty_file in [st_jsonl_path, st_h5_path]:
                         if os.path.exists(dirty_file):
                             os.remove(dirty_file)
-                            print(f"  - 已清理历史脏数据: {os.path.basename(dirty_file)}")
+                            logger.info(f"  Removed stale file: {os.path.basename(dirty_file)}")
 
+                    t0 = time.time()
                     extractor = StochasticExtractor(model_name=target_model, model_kwargs=EVAL_CONFIG["model_kwargs"])
                     extractor.process_stochastic_from_file(
                         input_jsonl_path=base_meta_path, output_h5_path=st_h5_path, output_jsonl_path=st_jsonl_path,
@@ -214,20 +235,22 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
                     )
                     del extractor
                     torch.cuda.empty_cache()
+                    logger.info(f"[Phase 1] Stochastic generation done in {time.time()-t0:.1f}s")
                 else:
-                    print(f"[+] 采样缓存校验通过！完全满足当前 {len(active_detectors)} 个探测器的严苛要求，直接复用。")
+                    logger.info(f"[Phase 1] Cache valid — reusing existing stochastic samples for {len(active_detectors)} detectors.")
 
-            # 【阶段 1.2】auxiliary eval 引擎（verbalize / self_evaluator 独立生成）
+            # Phase 1.2 — auxiliary evals (verbalize / self_evaluator)
             if need_aux_eval:
-                print(f"[*] 执行阶段 1.2 Auxiliary 缓存完整性校验...")
+                logger.info("[Phase 1.2] Validating auxiliary eval cache...")
                 is_aux_cache_valid = validate_aux_cache(aux_jsonl_path, active_detectors, expected_total)
 
                 if not is_aux_cache_valid:
-                    print(f"[!] Auxiliary 校验未通过：即将启动独立生成引擎...")
+                    logger.warning("Auxiliary cache invalid — regenerating...")
                     if os.path.exists(aux_jsonl_path):
                         os.remove(aux_jsonl_path)
-                        print(f"  - 已清理历史脏数据: {os.path.basename(aux_jsonl_path)}")
+                        logger.info(f"  Removed stale file: {os.path.basename(aux_jsonl_path)}")
 
+                    t0 = time.time()
                     aux_evaluator = AuxiliaryEvaluator(model_name=target_model, model_kwargs=EVAL_CONFIG["model_kwargs"])
                     aux_evaluator.process_auxiliary_from_file(
                         input_jsonl_path=base_meta_path,
@@ -240,62 +263,68 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
                     )
                     del aux_evaluator
                     torch.cuda.empty_cache()
+                    logger.info(f"[Phase 1.2] Auxiliary eval done in {time.time()-t0:.1f}s")
                 else:
-                    print(f"[+] Auxiliary 缓存校验通过！直接复用。")
+                    logger.info("[Phase 1.2] Auxiliary cache valid — reusing.")
 
-            # 【阶段 1.5】全自动造子弹
+            # Phase 1.5 — base logit recovery
             if need_logprobs and not os.path.exists(recovery_h5_path):
-                print(f"\n[*] 启动 'base_logit_recovery' 独立补票...")
+                logger.info("[Phase 1.5] Running base_logit_recovery feature extraction...")
+                t0 = time.time()
                 process_dataset(input_jsonl=base_meta_path, output_h5=recovery_h5_path, model_name=target_model, method="base_logit_recovery", model_kwargs=EVAL_CONFIG["model_kwargs"])
                 torch.cuda.empty_cache()
+                logger.info(f"[Phase 1.5] base_logit_recovery done in {time.time()-t0:.1f}s")
 
             for det in active_detectors:
                 if getattr(det, "requires_qa_features", False) and det.name != "saplma":
                     qa_path = os.path.join(exp_dir, f"05_qa_features_{det.name}.h5")
-                    
+
                     need_extract = False
                     if not os.path.exists(qa_path):
+                        logger.info(f"QA feature file missing for detector '{det.name}'.")
                         need_extract = True
                     else:
                         try:
                             with h5py.File(qa_path, 'r') as f_check:
                                 all_keys = list(f_check.keys())
                                 if not all_keys or len(all_keys) < expected_total:
-                                    print(f"[*] 发现 {det.name} 特征不完整 (当前 {len(all_keys)} 个，预期 {expected_total} 个)！准备重跑...")
+                                    logger.warning(f"QA features for '{det.name}' incomplete ({len(all_keys)}/{expected_total}) — re-extracting...")
                                     need_extract = True
-                                
                                 else:
                                     sample_grp = f_check[all_keys[0]]
                                     if det.name == "self_evaluator" and "logprobs" not in sample_grp:
-                                        print(f"[*] 检测到 {det.name} 缺失对数概率 (logprobs)，准备重跑...")
+                                        logger.warning(f"'{det.name}' missing logprobs field — re-extracting...")
                                         need_extract = True
                                     elif det.name == "icr_probe" and "icr_feature" not in sample_grp:
-                                        print(f"[*] 检测到 {det.name} 核心字段缺失，准备重跑...")
+                                        logger.warning(f"'{det.name}' missing icr_feature field — re-extracting...")
                                         need_extract = True
                                     elif det.name == "sep" and "sep_points" not in sample_grp:
-                                        print(f"[*] 检测到 {det.name} 核心字段缺失 (sep_points)，准备重跑...")
+                                        logger.warning(f"'{det.name}' missing sep_points field — re-extracting...")
                                         need_extract = True
-                                
                         except Exception as e:
-                            print(f"[*] 发现 {det.name} 特征文件已损坏，准备重跑提取...")
+                            logger.warning(f"QA feature file for '{det.name}' is corrupt ({e}) — re-extracting...")
                             need_extract = True
 
                     if need_extract:
-                        print(f"\n[*] 启动 {det.name} 专属特征提取引擎...")
+                        logger.info(f"[Phase 1.x] Extracting QA features for detector '{det.name}'...")
+                        t0 = time.time()
                         process_dataset(input_jsonl=base_meta_path, output_h5=qa_path, model_name=target_model, method=det.name, model_kwargs=EVAL_CONFIG["model_kwargs"])
                         torch.cuda.empty_cache()
+                        logger.info(f"  '{det.name}' QA extraction done in {time.time()-t0:.1f}s")
 
-            # 【阶段 2】加载特征
-            print(f"[*] 加载数据特征 (建立 Train / Test 屏障)...")
+            # Phase 2 — load features
+            logger.info("[Phase 2] Loading cached features into memory...")
+            t0 = time.time()
             st_dict = {}
             if os.path.exists(st_jsonl_path):
                 with open(st_jsonl_path, 'r', encoding='utf-8') as f:
                     for line in f:
                         d = json.loads(line)
                         st_dict[str(d["sample_id"])] = {
-                            "samples": d.get("stochastic_samples", []), 
+                            "samples": d.get("stochastic_samples", []),
                             "log_likelihoods": d.get("stochastic_log_likelihoods", [])
                         }
+                logger.info(f"  Loaded {len(st_dict)} stochastic sample entries.")
 
             aux_dict = {}
             if os.path.exists(aux_jsonl_path):
@@ -306,15 +335,19 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
                             "verbalize_response": d.get("verbalize_response"),
                             "self_evaluator_raw": d.get("self_evaluator_raw")
                         }
+                logger.info(f"  Loaded {len(aux_dict)} auxiliary eval entries.")
 
             recovery_dict = {}
             if os.path.exists(recovery_h5_path):
                 with h5py.File(recovery_h5_path, 'r') as rec_h5:
                     for group_name in rec_h5.keys():
                         recovery_dict[group_name.replace("_base_logit_recovery", "")] = rec_h5[group_name]["logprobs"][:]
+                logger.info(f"  Loaded {len(recovery_dict)} logit recovery entries.")
 
             base_h5 = h5py.File(base_h5_path, 'r') if os.path.exists(base_h5_path) else None
             st_h5 = h5py.File(st_h5_path, 'r') if os.path.exists(st_h5_path) else None
+            if not base_h5:
+                logger.warning(f"Base hidden states file not found: {base_h5_path}")
 
             qa_h5_handles = {}
             for det in active_detectors:
@@ -323,30 +356,35 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
                         qa_h5_handles["saplma"] = h5py.File(recovery_h5_path, 'r')
                         continue
                     qa_path = os.path.join(exp_dir, f"05_qa_features_{det.name}.h5")
-                    if os.path.exists(qa_path): qa_h5_handles[det.name] = h5py.File(qa_path, 'r')
+                    if os.path.exists(qa_path):
+                        qa_h5_handles[det.name] = h5py.File(qa_path, 'r')
+                    else:
+                        logger.warning(f"QA feature file not found for '{det.name}': {qa_path}")
 
-            # 🚀 按花名册提人
             train_accessors = build_accessors(train_meta_path, base_h5, st_dict, st_h5, recovery_dict, aux_dict)
             test_accessors = build_accessors(test_meta_path, base_h5, st_dict, st_h5, recovery_dict, aux_dict)
+            logger.info(f"[Phase 2] Data loaded in {time.time()-t0:.1f}s — train={len(train_accessors)}  test={len(test_accessors)}")
 
-            print(f"[*] 数据隔离完毕。Train: {len(train_accessors)} 个 | Test: {len(test_accessors)} 个")
-
-            # 【阶段 3】打分流程
+            # Phase 3 — scoring
+            logger.info("[Phase 3] Running detectors...")
             raw_scores = {acc.sample_id: {} for acc in test_accessors}
             for detector in active_detectors:
-                print(f"\n>>> {detector.name} 运行中...")
+                logger.info(f"  Running detector: {detector.name}")
+                t0 = time.time()
                 if getattr(detector, "requires_qa_features", False):
                     target_h5 = qa_h5_handles.get(detector.name)
                     for acc in train_accessors + test_accessors:
                         acc.qa_h5_file = target_h5
-                        acc.method_type = detector.name 
-                
-                detector.fit(train_accessors)
-                for acc in tqdm(test_accessors, desc="Scoring on Test Set", leave=False):
-                    raw_scores[acc.sample_id][detector.name] = detector.predict_score(acc)
+                        acc.method_type = detector.name
 
-            # 【阶段 4】最终算分
-            print(f"\n[*] 写入实验报告 (仅限测试集)...")
+                detector.fit(train_accessors)
+                logger.info(f"    fit() complete — scoring {len(test_accessors)} test samples...")
+                for acc in tqdm(test_accessors, desc=f"Scoring [{detector.name}]", leave=False):
+                    raw_scores[acc.sample_id][detector.name] = detector.predict_score(acc)
+                logger.info(f"    {detector.name} done in {time.time()-t0:.1f}s")
+
+            # Phase 4 — metrics
+            logger.info("[Phase 4] Computing metrics and writing report...")
             final_report = {"metrics": {}, "raw_scores": raw_scores}
             for det in active_detectors:
                 y_true, y_pred = [], []
@@ -357,19 +395,25 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
                     if score is None or math.isnan(float(score)): continue
                     y_true.append(1 if label == "hallucination" else 0)
                     y_pred.append(float(score))
-                
+
                 if y_true and len(set(y_true)) > 1:
                     m = ClassificationEvaluator.compute_metrics(y_true, y_pred)
                     final_report["metrics"][det.name] = m
-                    print(f"  - [{det.name:20}] AUROC: {m['AUROC']:.2f}% (测试样本: {len(y_true)})")
+                    logger.info(f"  {det.name:<25} AUROC={m['AUROC']:.2f}%  AUPR={m['AUPR']:.2f}%  FPR@95={m['FPR@95']:.2f}%  (n={len(y_true)})")
+                else:
+                    logger.warning(f"  {det.name}: skipped — insufficient or single-class labels (n={len(y_true)})")
 
             with open(final_report_path, 'w', encoding='utf-8') as f:
                 json.dump(final_report, f, ensure_ascii=False, indent=2)
+            logger.info(f"Report saved to: {final_report_path}")
 
             if base_h5: base_h5.close()
             if st_h5: st_h5.close()
             for h in qa_h5_handles.values():
                 if h: h.close()
+
+            logger.info(f"DONE benchmark: model={target_model}  dataset={dataset_name}  total_time={time.time()-benchmark_start:.1f}s")
+            logger.info("=" * 60)
 
 if __name__ == "__main__":
     run_benchmark(
