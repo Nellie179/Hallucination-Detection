@@ -2,7 +2,7 @@
 """
 Extract hidden states, LOGPROBS and ICR Scores from Q+A (Universal Version)
 权威拼接版：基于 Tensor 物理拼接，确保 Token 绝对对齐并防止索引越界。
-已新增 SEP (Semantic Entropy Probes) 所需的 TBG 和 SLT 特征提取逻辑。
+已新增 SEP (Semantic Entropy Probes) 和 PRISM (Prompt-guided) 特征提取逻辑。
 """
 
 import os
@@ -14,6 +14,7 @@ import numpy as np
 from tqdm import tqdm
 from typing import List, Dict, Any, Tuple
 from transformers import AutoModelForCausalLM, AutoTokenizer
+import math
 
 # 🎯 引入 ICR 核心算法组件
 from data_utils.icr_score import ICRScore
@@ -61,50 +62,39 @@ class QAHiddenStateExtractor:
 
     def _pack_for_icr(self, hidden_states, attentions, prompt_len):
         """将 HF 输出转换为 ICRScore 结构，使用动态长度感应，防止任何层数不匹配"""
-        # 🎯 增加一个安全检查：如果 attentions 为空，直接报错提醒环境问题
         if attentions is None or len(attentions) == 0:
             raise ValueError("未能获取到 Attention 矩阵。请确认 attn_implementation 为 'eager'。")
 
-        # 🎯 直接转换为局部 tuple，确保每一行代码都只针对当前的真实数据
         hs_tuple = tuple(h.detach() for h in hidden_states)
         att_tuple = tuple(a.detach() for a in attentions)
         
-        # 🛡️ 护盾 1：动态获取当前样本的真实层数
         actual_hs_layers = len(hs_tuple)
         actual_att_layers = len(att_tuple)
         
-        # 获取序列总长度
         B, S, D = hs_tuple[0].shape
         output_size = max(0, S - prompt_len)
 
         nested_hs = []
-        # 处理输入段 (Prompt)
         if actual_hs_layers > 0:
-            # 🛡️ 护盾 2：这里 range 改用实际拿到的 actual_hs_layers
             hs_input = [hs_tuple[ell][0, :prompt_len, :].unsqueeze(0) for ell in range(actual_hs_layers)]
             nested_hs.append(hs_input)
         
-        # 处理回答段 (逐 token)
         for t in range(output_size):
             pos = prompt_len + t
-            if pos >= S: break # 🛡️ 护盾 3：物理越界拦截
+            if pos >= S: break 
             
-            # 🛡️ 护盾 4：动态索引。如果某一层没拿到，列表生成式会直接报错，这里我们用 actual 保证安全
             token_hs = [hs_tuple[ell][0, pos:pos+1, :].unsqueeze(0) for ell in range(actual_hs_layers)]
             nested_hs.append(token_hs)
 
         nested_att = []
-        # 处理输入段
         if actual_att_layers > 0:
             att_input = [att_tuple[ell][0].unsqueeze(0) for ell in range(actual_att_layers)]
             nested_att.append(att_input)
         
-        # 处理回答段 (逐 token)
         for t in range(output_size):
             pos = prompt_len + t
             if pos >= S: break
             
-            # 🛡️ 护盾 5：针对 Attention 层数做独立的动态迭代
             token_att = [att_tuple[ell][0, :, pos:pos+1, :].unsqueeze(0) for ell in range(actual_att_layers)]
             nested_att.append(token_att)
             
@@ -117,31 +107,36 @@ class QAHiddenStateExtractor:
         method: str,
         extract_all_layers: bool = True
     ) -> Dict[str, Any]:
-        # 1. 🎯 权威编码：分别 Encode 避免分词污染
-        p_ids = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=True).to(self.device)
-        a_ids = self.tokenizer(answer, return_tensors="pt", add_special_tokens=False).to(self.device)
         
-        # ==========================================
-        # 🛡️ 战时截断补丁：防 Eager 模式 OOM
-        # ==========================================
-        MAX_SEQ_LEN = 128  # A100 剩余 33GB 时的绝对安全线
-        a_len = a_ids.input_ids.shape[1]
-        p_len = p_ids.input_ids.shape[1]
-        
-        # 只针对吃显存的 icr_probe 触发截断，且总长超标时才动手
-        if method == "icr_probe" and (p_len + a_len) > MAX_SEQ_LEN:
-            # 优先保证大模型的 Answer 完整，截断 Prompt 的头部 (保留离答案最近的上下文)
-            keep_p_len = max(10, MAX_SEQ_LEN - a_len) 
-            p_ids.input_ids = p_ids.input_ids[:, -keep_p_len:]
-            p_ids.attention_mask = p_ids.attention_mask[:, -keep_p_len:]
-            print(f"  [!] 触发长文本截断: Prompt 从 {p_len} 缩减至 {keep_p_len} Tokens")
+        # ==============================================================================
+        # 🚨 特殊前处理：重构 Prompt (PRISM & P(True) 路线)
+        # ==============================================================================
+        if method == "prism":
+            statement = f"{prompt}\n{answer}".strip()
+            # 完全对齐 PRISM 官方提示词
+            prism_prompt = f"Does the statement '{statement}' accurately reflect the truth?"
             
-        prompt_len = p_ids.input_ids.shape[1]
+            full_ids = self.tokenizer(prism_prompt, return_tensors="pt", add_special_tokens=True).to(self.device).input_ids
+            full_mask = self.tokenizer(prism_prompt, return_tensors="pt", add_special_tokens=True).to(self.device).attention_mask
+            prompt_len = full_ids.shape[1] 
+            seq_len = full_ids.shape[1]
         
-        # 2. 🚀 Tensor 级物理拼接
-        full_ids = torch.cat([p_ids.input_ids, a_ids.input_ids], dim=-1)
-        full_mask = torch.cat([p_ids.attention_mask, a_ids.attention_mask], dim=-1)
-        seq_len = full_ids.shape[1] # 👈 用于定位 SLT
+        # 🚀 [新增] P(True) / Self-Evaluator 路线
+        elif method == "self_evaluator":
+            target_prompt = f"Question: {prompt}\nProposed Answer: {answer}\nIs the proposed answer True or False?\nAnswer:"
+            full_ids = self.tokenizer(target_prompt, return_tensors="pt", add_special_tokens=True).to(self.device).input_ids
+            full_mask = self.tokenizer(target_prompt, return_tensors="pt", add_special_tokens=True).to(self.device).attention_mask
+            prompt_len = full_ids.shape[1]
+            seq_len = full_ids.shape[1]
+        
+        else:
+            # 普通 Q+A 拼接 (CCS, SEP, ICR 等)
+            p_ids = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=True).to(self.device)
+            a_ids = self.tokenizer(answer, return_tensors="pt", add_special_tokens=False).to(self.device)
+            prompt_len = p_ids.input_ids.shape[1]
+            full_ids = torch.cat([p_ids.input_ids, a_ids.input_ids], dim=-1)
+            full_mask = torch.cat([p_ids.attention_mask, a_ids.attention_mask], dim=-1)
+            seq_len = full_ids.shape[1] 
         
         # 3. 推理
         need_attn = (method == "icr_probe")
@@ -155,18 +150,41 @@ class QAHiddenStateExtractor:
             logits = outputs.logits
 
         # --- A. 概率补票 (Shift Logits 对齐) ---
-        shift_logits = logits[0, :-1, :]
-        shift_labels = full_ids[0, 1:]
-        log_probs_full = torch.nn.functional.log_softmax(shift_logits, dim=-1)
-        target_logprobs = torch.gather(log_probs_full, index=shift_labels.unsqueeze(-1), dim=-1).squeeze(-1)
-        
-        # 截取 Answer 段：从索引 prompt_len - 1 开始
-        ans_lps = target_logprobs[prompt_len-1:].cpu().float().numpy().astype(np.float16)
+        ans_lps = None
+        if method not in ["prism", "self_evaluator"]: 
+            shift_logits = logits[0, :-1, :]
+            shift_labels = full_ids[0, 1:]
+            log_probs_full = torch.nn.functional.log_softmax(shift_logits, dim=-1)
+            target_logprobs = torch.gather(log_probs_full, index=shift_labels.unsqueeze(-1), dim=-1).squeeze(-1)
+            # 🚨 修复潜在的维度越界问题：确保不会取到负数索引
+            start_idx = max(0, prompt_len - 1)
+            ans_lps = target_logprobs[start_idx:].cpu().float().numpy().astype(np.float16)
+
+        # 🚀 [新增] 专门截获 P(True) 第一个 Token 的预测 Logits
+        if method == "self_evaluator":
+            next_token_logits = logits[0, -1, :] 
+            
+            # 使用 encode 获取 token IDs，并处理可能的空列表情况
+            true_token_ids = self.tokenizer.encode("True", add_special_tokens=False)
+            false_token_ids = self.tokenizer.encode("False", add_special_tokens=False)
+            
+            id_true = true_token_ids[-1] if true_token_ids else 0
+            id_false = false_token_ids[-1] if false_token_ids else 0
+
+            logit_true = next_token_logits[id_true].item()
+            logit_false = next_token_logits[id_false].item()
+            
+            # 🚨 修复上溢出问题：使用 logsumexp 技巧计算 Softmax 概率
+            max_logit = max(logit_true, logit_false)
+            prob_true = math.exp(logit_true - max_logit) / (math.exp(logit_true - max_logit) + math.exp(logit_false - max_logit) + 1e-9)
+            
+            # 存入 log 概率
+            ans_lps = np.array([math.log(max(prob_true, 1e-9))]).astype(np.float16)
 
         # --- B. 特征提取 ---
         hs_res = {}
         tw_res = {}
-        sep_res = {} # 👈 存储 SEP 所需的点特征
+        sep_res = {} 
         icr_feat = None
         
         # 🎯 ICR Score 计算
@@ -189,18 +207,24 @@ class QAHiddenStateExtractor:
             hf_l_idx = l_idx + 1
             all_layer_hs = outputs.hidden_states[hf_l_idx][0] # [seq_len, dim]
             
-            # 🎯 普通 Answer 平均特征
-            ans_hs = all_layer_hs[prompt_len:, :]
-            hs_res[l_idx] = ans_hs.mean(dim=0).cpu().float().numpy().astype(np.float16)
+            # ==============================================================================
+            # 🚨 [关键对齐] PRISM 只提取最后一个 Token
+            # ==============================================================================
+            if method == "prism":
+                # 取序列最后一个 token
+                hs_res[l_idx] = all_layer_hs[-1, :].cpu().float().numpy().astype(np.float16)
+            
+            else:
+                # 普通 Answer 平均特征
+                ans_hs = all_layer_hs[prompt_len:, :]
+                hs_res[l_idx] = ans_hs.mean(dim=0).cpu().float().numpy().astype(np.float16)
             
             if method == "icr_probe":
                 tw_res[l_idx] = ans_hs.cpu().float().numpy().astype(np.float16)
 
             # 🎯 SEP 关键点提取
             if method == "sep":
-                # TBG: Token Before Generation (Prompt 最后一个词)
                 tbg_feat = all_layer_hs[prompt_len - 1, :].cpu().float().numpy().astype(np.float16)
-                # SLT: Selected Last Token (Answer 最后一个词)
                 slt_feat = all_layer_hs[seq_len - 1, :].cpu().float().numpy().astype(np.float16)
                 sep_res[f"tbg_layer_{l_idx}"] = tbg_feat
                 sep_res[f"slt_layer_{l_idx}"] = slt_feat
@@ -215,7 +239,6 @@ class QAHiddenStateExtractor:
 
 def process_dataset(input_jsonl, output_h5, model_name, method, model_kwargs=None, max_samples=None):
     print(f"\n{'='*70}\n🚀 启动 QA 拼接特征提取器 ({method.upper()})\n{'='*70}")
-    # 🎯 显式传入 method
     extractor = QAHiddenStateExtractor(model_name=model_name, model_kwargs=model_kwargs, method=method)
 
     samples = []
@@ -233,7 +256,6 @@ def process_dataset(input_jsonl, output_h5, model_name, method, model_kwargs=Non
             if not p or not a: continue
 
             g_name = f"{sid}_{method}"
-            # 🛡️ 断点续传：检查数据是否存在
             if g_name in f_h5:
                 complete = True
                 if method == "icr_probe" and "icr_feature" not in f_h5[g_name]: complete = False
@@ -245,13 +267,13 @@ def process_dataset(input_jsonl, output_h5, model_name, method, model_kwargs=Non
                 res = extractor.extract_features(p, a, method)
                 if g_name in f_h5: del f_h5[g_name]
                 grp = f_h5.create_group(g_name)
-                grp.create_dataset("logprobs", data=res["logprobs"])
+                
+                if method != "prism": # PRISM 没有 logprobs
+                    grp.create_dataset("logprobs", data=res["logprobs"])
                 
                 if method == "ccs":
-                    # CCS 特殊处理：正负双向
                     res_p = extractor.extract_features(p, a, "ccs")
                     res_n = extractor.extract_features("It is not true that:", f"{p}\n{a}", "ccs")
-                    # 此处根据您之前的 CCS 逻辑进行存储... (保持原子逻辑)
                     for mode, r in [("positive", res_p), ("negative", res_n)]:
                         sub = grp.create_group(mode)
                         sub.create_dataset("logprobs", data=r["logprobs"])

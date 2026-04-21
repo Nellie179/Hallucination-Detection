@@ -24,6 +24,19 @@ from data_utils.accessor import SampleAccessor
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# 🛠️ [官方对齐新增]: 扩充列表用于交叉对比矩阵计算
+def expand_list1(lst, n):
+    expanded = []
+    for item in lst:
+        expanded.extend([item] * n)
+    return expanded
+
+def expand_list2(lst, n):
+    expanded = []
+    for _ in range(n):
+        expanded.extend(lst)
+    return expanded
+
 
 @register_detector("selfcheck_bertscore")
 class SelfCheckBERTScoreDetector(BaseDetector):
@@ -52,6 +65,7 @@ class SelfCheckBERTScoreDetector(BaseDetector):
 
         # 延迟加载 BERTScore 模型（避免初始化时占用资源）
         self.scorer = None
+        self.nlp = None
 
         logger.info(f"[{self.name}] SelfCheckGPT(BERTScore) 初始化完成")
         logger.info(f"  - 依赖声明: requires_stochastic = True")
@@ -65,13 +79,22 @@ class SelfCheckBERTScoreDetector(BaseDetector):
         except ImportError:
             return False
 
-    def _load_scorer(self):
-        """延迟加载 BERTScore 模型"""
-        if self.scorer is not None:
+    def _load_dependencies(self):
+        """延迟加载 BERTScore 模型和 Spacy 分词器"""
+        if self.scorer is not None and self.nlp is not None:
             return
 
         try:
+            import spacy
             from bert_score import BERTScorer
+
+            logger.info(f"[{self.name}] 正在加载 spacy 模型 (en_core_web_sm)...")
+            try:
+                self.nlp = spacy.load("en_core_web_sm")
+            except OSError:
+                logger.warning("未找到 spacy 模型，尝试自动下载...")
+                os.system("python -m spacy download en_core_web_sm")
+                self.nlp = spacy.load("en_core_web_sm")
 
             logger.info(f"[{self.name}] 正在加载 BERTScore 模型: {self.bert_model}...")
 
@@ -82,74 +105,93 @@ class SelfCheckBERTScoreDetector(BaseDetector):
                 device=self.device
             )
 
-            logger.info(f"[{self.name}] ✓ BERTScore 模型加载完成")
+            logger.info(f"[{self.name}] ✓ 依赖库加载完成")
 
         except ImportError:
             raise ImportError(
-                f"[{self.name}] 缺少依赖库 bert-score\n"
-                f"请安装: pip install bert-score"
+                f"[{self.name}] 缺少依赖库 bert-score 或 spacy\n"
+                f"请安装: pip install bert-score spacy"
             )
         except Exception as e:
-            raise RuntimeError(f"[{self.name}] BERTScore 模型加载失败: {e}")
+            raise RuntimeError(f"[{self.name}] 依赖库加载失败: {e}")
 
     def fit(self, train_accessors: List[SampleAccessor]) -> None:
         """
-        免训练方法，仅用于在开始评估前把 BERT 模型加载进显存
+        免训练方法，仅用于在开始评估前把模型加载进显存
         """
-        self._load_scorer()
+        self._load_dependencies()
 
     def predict_score(self, accessor: SampleAccessor) -> float:
         """
         核心评估逻辑：计算主答案与多次采样的 BERTScore F1 分数。
+        🛠️ [官方对齐修改]: 引入细颗粒度拆句对比
         """
-        if self.scorer is None:
-            self._load_scorer()
+        if self.scorer is None or self.nlp is None:
+            self._load_dependencies()
 
-        # 优雅地从管家那里调取对应样本的数据
         main_output = accessor.get_model_output_text()
         samples = accessor.get_stochastic_samples()
 
-        # 鲁棒性检查
         if not main_output or not main_output.strip():
             logger.debug(f"Sample {accessor.sample_id}: 主输出为空")
             return float('nan')
 
-        if not samples:
-            logger.warning(f"Sample {accessor.sample_id}: 缺少采样数据")
-            return float('nan')
-
         valid_samples = [s for s in samples if s and s.strip()]
         if not valid_samples:
+            logger.warning(f"Sample {accessor.sample_id}: 缺少有效采样数据")
             return float('nan')
 
         try:
-            # BERTScore 计算：输入格式为 (cands, refs)
-            # 我们将 valid_samples 作为候选 (hypotheses/cands)
-            # 主答案复制多份作为参考 (references)
-            references = [main_output] * len(valid_samples)
-            hypotheses = valid_samples
+            # 1. 主答案分句
+            sentences = [sent.text.strip() for sent in self.nlp(main_output).sents]
+            sentences = [sent for sent in sentences if len(sent) > 0]
+            num_sentences = len(sentences)
+            
+            if num_sentences == 0:
+                return float('nan')
 
-            P, R, F1 = self.scorer.score(hypotheses, references)
+            num_samples = len(valid_samples)
+            bertscore_array = np.zeros((num_sentences, num_samples))
 
-            # 使用 F1 分数的平均值作为一致性度量
-            avg_f1 = F1.mean().item()
+            # 2. 遍历采样样本，分别计算张量 F1
+            for s in range(num_samples):
+                sample_passage = valid_samples[s]
+                sentences_sample = [sent.text.strip() for sent in self.nlp(sample_passage).sents]
+                sentences_sample = [sent for sent in sentences_sample if len(sent) > 0]
+                num_sentences_sample = len(sentences_sample)
 
-            # 转换为幻觉分数：相似度越低，幻觉概率越高
-            hallucination_score = 1.0 - avg_f1
+                if num_sentences_sample == 0:
+                    continue
 
-            return float(hallucination_score)
+                refs = expand_list1(sentences, num_sentences_sample)
+                cands = expand_list2(sentences_sample, num_sentences)
+
+                P, R, F1 = self.scorer.score(cands, refs)
+                
+                # [num_sentences, num_sentences_sample]
+                F1_arr = F1.reshape(num_sentences, num_sentences_sample)
+                # 寻找每个主答案句子在当前采样中的最高 F1
+                F1_arr_max_axis1 = F1_arr.max(axis=1).values.numpy()
+                bertscore_array[:, s] = F1_arr_max_axis1
+
+            # 3. 汇总得分
+            bertscore_mean_per_sent = bertscore_array.mean(axis=-1)
+            one_minus_bertscore_mean_per_sent = 1.0 - bertscore_mean_per_sent
+            
+            # 返回整段话不一致性的平均值
+            return float(np.mean(one_minus_bertscore_mean_per_sent))
 
         except Exception as e:
-            # 🛠️ [核心修复]: 拒绝盲猜，保留完整堆栈日志
             logger.error(f"Sample {accessor.sample_id}: BERTScore 计算失败:\n{traceback.format_exc()}")
             return float('nan')
 
     def analyze(self, accessor: SampleAccessor) -> dict:
         """
         详细分析（用于调试和可视化）
+        🛠️ [官方对齐修改]: 内部计算已同步，确保 debug 返回结果和 predict 一致
         """
-        if self.scorer is None:
-            self._load_scorer()
+        if self.scorer is None or self.nlp is None:
+            self._load_dependencies()
 
         main_output = accessor.get_model_output_text()
         samples = accessor.get_stochastic_samples()
@@ -159,21 +201,48 @@ class SelfCheckBERTScoreDetector(BaseDetector):
         if not valid_samples:
             return {"error": "No valid samples"}
 
-        references = [main_output] * len(valid_samples)
-        P, R, F1 = self.scorer.score(valid_samples, references)
+        try:
+            sentences = [sent.text.strip() for sent in self.nlp(main_output).sents]
+            sentences = [sent for sent in sentences if len(sent) > 0]
+            num_sentences = len(sentences)
 
-        f1_scores = F1.tolist()
+            if num_sentences == 0:
+                return {"error": "No valid sentences to analyze"}
 
-        return {
-            "main_output": main_output,
-            "num_samples": len(valid_samples),
-            "f1_scores": f1_scores,
-            "avg_f1": float(np.mean(f1_scores)),
-            "std_f1": float(np.std(f1_scores)),
-            "min_f1": float(np.min(f1_scores)),
-            "max_f1": float(np.max(f1_scores)),
-            "hallucination_score": 1.0 - np.mean(f1_scores)
-        }
+            num_samples = len(valid_samples)
+            bertscore_array = np.zeros((num_sentences, num_samples))
+
+            for s in range(num_samples):
+                sample_passage = valid_samples[s]
+                sentences_sample = [sent.text.strip() for sent in self.nlp(sample_passage).sents]
+                sentences_sample = [sent for sent in sentences_sample if len(sent) > 0]
+                num_sentences_sample = len(sentences_sample)
+
+                if num_sentences_sample == 0:
+                    continue
+
+                refs = expand_list1(sentences, num_sentences_sample)
+                cands = expand_list2(sentences_sample, num_sentences)
+
+                P, R, F1 = self.scorer.score(cands, refs)
+                F1_arr = F1.reshape(num_sentences, num_sentences_sample)
+                bertscore_array[:, s] = F1_arr.max(axis=1).values.numpy()
+
+            bertscore_mean_per_sent = bertscore_array.mean(axis=-1)
+            overall_avg_f1 = float(np.mean(bertscore_mean_per_sent))
+
+            return {
+                "main_output": main_output,
+                "num_samples": num_samples,
+                "f1_scores_per_sentence": bertscore_mean_per_sent.tolist(),
+                "avg_f1": overall_avg_f1,
+                "std_f1": float(np.std(bertscore_mean_per_sent)),
+                "min_f1": float(np.min(bertscore_mean_per_sent)),
+                "max_f1": float(np.max(bertscore_mean_per_sent)),
+                "hallucination_score": 1.0 - overall_avg_f1
+            }
+        except Exception as e:
+            return {"error": f"Analyze failed: {e}"}
 
 
 # ==========================================

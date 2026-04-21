@@ -7,6 +7,7 @@ SelfCheckNLI Detector - 灰盒 NLI 一致性检测器
     2. 将每个句子作为 Hypothesis，多次采样的文本 (Stochastic Samples) 作为 Premise。
     3. 用 NLI 模型判断 Premise 是否能蕴含 (Entail) Hypothesis。
     4. 如果多次采样都无法蕴含该句子，说明该句子是幻觉。
+    🎯 已对齐官方实现：直接抓取 CONTRADICTION 类的连续 Softmax 概率作为幻觉分数。
 """
 
 import numpy as np
@@ -43,6 +44,7 @@ class SelfCheckNLIDetector(BaseDetector):
         self.nli_model_name = nli_model
         self.device = device if device else ("cuda" if self._is_cuda_available() else "cpu")
         self.nli_pipeline = None
+        self.nlp = None
 
         logger.info(f"[{self.name}] SelfCheckNLI 初始化完成 (裁判模型: {self.nli_model_name})")
 
@@ -53,15 +55,23 @@ class SelfCheckNLIDetector(BaseDetector):
         except ImportError:
             return False
 
-    def _load_nli_model(self):
-        """安全加载 NLI 判定模型"""
-        if self.nli_pipeline is not None:
+    def _load_dependencies(self):
+        """安全加载 NLI 判定模型和 Spacy"""
+        if self.nli_pipeline is not None and self.nlp is not None:
             return
         try:
+            import spacy
             from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
+            
+            try:
+                self.nlp = spacy.load("en_core_web_sm")
+            except OSError:
+                logger.warning("未找到 spacy 模型，尝试自动下载...")
+                os.system("python -m spacy download en_core_web_sm")
+                self.nlp = spacy.load("en_core_web_sm")
+
             logger.info(f"[{self.name}] 正在加载 NLI 模型: {self.nli_model_name}...")
             
-            # 🎯 拆分加载，断绝 pipeline 底层瞎搞的可能性
             tokenizer = AutoTokenizer.from_pretrained(self.nli_model_name, use_fast=False)
             model = AutoModelForSequenceClassification.from_pretrained(self.nli_model_name)
             
@@ -72,28 +82,21 @@ class SelfCheckNLIDetector(BaseDetector):
                 device=0 if self.device == "cuda" else -1,
                 batch_size=16,
                 truncation=True,
-                max_length=512
+                max_length=512,
+                top_k=None # 🛠️ [官方对齐修改]: 返回所有类的概率分布，而不是单一标签
             )
             logger.info(f"[{self.name}] ✓ NLI 模型加载完成")
-        except ImportError:
-            raise ImportError(f"[{self.name}] 缺少 transformers 库")
+        except ImportError as e:
+            raise ImportError(f"[{self.name}] 缺少依赖库: {e}")
 
     def fit(self, train_accessors: List[SampleAccessor]) -> None:
         """预热加载模型"""
-        self._load_nli_model()
-
-    def _split_into_sentences(self, text: str) -> List[str]:
-        """简单的分句逻辑（如果是英文推荐用 spacy，这里用标点做 fallback）"""
-        import re
-        # 按句号、问号、感叹号及换行符分句
-        sentences = re.split(r'(?<=[.!?\n])\s+', text.strip())
-        return [s.strip() for s in sentences if len(s.strip()) > 0]
+        self._load_dependencies()
 
     def predict_score(self, accessor: SampleAccessor) -> float:
-        if self.nli_pipeline is None:
-            self._load_nli_model()
+        if self.nli_pipeline is None or self.nlp is None:
+            self._load_dependencies()
 
-        # 1. 获取主回答和多次采样
         main_text = accessor.metadata.get("model_output_text", "")
         stochastic_data = accessor.stochastic_samples_dict.get(accessor.sample_id, {})
         
@@ -109,8 +112,9 @@ class SelfCheckNLIDetector(BaseDetector):
             return float('nan')
 
         try:
-            # 2. 对主回答分句
-            sentences = self._split_into_sentences(main_text)
+            # 2. 对主回答分句 (使用 Spacy 保证质量)
+            sentences = [sent.text.strip() for sent in self.nlp(main_text).sents]
+            sentences = [sent for sent in sentences if len(sent) > 0]
             if not sentences:
                 return float('nan')
 
@@ -124,23 +128,25 @@ class SelfCheckNLIDetector(BaseDetector):
                     pair_indices.append((s_idx, samp_idx))
 
             # 4. 批量推理
+            # top_k=None 保证返回格式为 [[{'label': 'A', 'score': 0.1}, ...], ...]
             results = self.nli_pipeline(pairs)
 
-            # 5. 解析分数：计算每个句子不被蕴含（Contradiction/Neutral）的概率
-            # Roberta-large-mnli 的 label: 'CONTRADICTION', 'NEUTRAL', 'ENTAILMENT'
+            # 5. 解析连续分数：精准抓取 contradiction 类的概率
             sentence_hallucination_scores = np.zeros(len(sentences))
             
-            for (s_idx, samp_idx), res in zip(pair_indices, results):
-                label = res['label'].upper()
-                score = res['score']
+            for (s_idx, samp_idx), res_list in zip(pair_indices, results):
+                contradiction_prob = 0.0
                 
-                # 如果是蕴含（Entailment），则幻觉风险为 0；否则将其计为有幻觉风险
-                # 原论文做法：非 entail 的概率作为该次采样的幻觉得分
-                is_entail = 'ENTAIL' in label or label == 'LABEL_2' # roberta LABEL_2 是 entailment
+                # 遍历三个类的打分，寻找代表冲突的类
+                # RoBERTa 的类名通常是 CONTRADICTION，但以防万一做了宽松匹配
+                for class_score in res_list:
+                    label = class_score['label'].upper()
+                    if 'CONTRADICTION' in label or label == 'LABEL_0': # roberta 的 0 通常是 contradiction
+                        contradiction_prob = class_score['score']
+                        break
                 
-                if not is_entail:
-                    # 如果不是 entail，加上权重（简单的做法是直接 +1，或者加 score）
-                    sentence_hallucination_scores[s_idx] += 1.0
+                # 🛠️ [官方对齐修改]: 直接累加矛盾概率，告别离散 0/1 加分
+                sentence_hallucination_scores[s_idx] += contradiction_prob
 
             # 6. 对每个句子取平均（跨多次采样的平均幻觉概率）
             num_samples = len(valid_samples)

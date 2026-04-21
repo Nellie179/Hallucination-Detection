@@ -9,15 +9,13 @@ MIND (Multi-task INternal Detection) Detector - 多任务内部状态检测器
 
 方法：
     1. 特征提取:
-       - Hidden states (最后层的平均池化)
-       - Token probabilities
-       - Token entropy
-       - 最后层最后token的activation
+       - 严格对齐官方源码: 提取最后层最后一个Token的hidden state，与最后层全局平均hidden state拼接。
+       - 不使用对数概率和熵。
 
-    2. MLP架构:
-       - 4层: [hidden_dim] -> 256 -> 128 -> 64 -> 2
-       - ReLU激活
-       - Dropout (0.2)
+    2. MLP架构 (对齐官方):
+       - 输入层首先应用 Dropout (0.2)
+       - 4层: [input_dim] -> 256 -> 128 -> 64 -> 2
+       - 中间使用 ReLU 激活
 
     3. 训练:
        - 使用Wikipedia生成伪标注数据(可选)
@@ -67,19 +65,22 @@ except ImportError:
 
 
 class MINDMLPTorch(nn.Module):
-    """MIND的MLP分类器(PyTorch版本)"""
+    """MIND的MLP分类器(PyTorch版本) - 架构已严格对齐官方源码"""
 
     def __init__(self, input_dim, hidden_dims=[256, 128, 64], dropout=0.2):
         super().__init__()
 
         layers = []
+        
+        # 官方源码：Dropout 放置在输入层之后，而非每层之后
+        layers.append(nn.Dropout(dropout))
+        
         prev_dim = input_dim
-
         for hidden_dim in hidden_dims:
             layers.extend([
                 nn.Linear(prev_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout)
+                nn.ReLU()
+                # 注意：此处没有 Dropout，以对齐官方设定
             ])
             prev_dim = hidden_dim
 
@@ -99,7 +100,6 @@ class MINDDetector(BaseDetector):
 
     需要数据：
         - hidden_states (最后层)
-        - token_logprobs (可选,用于计算entropy)
     """
 
     def __init__(
@@ -110,18 +110,16 @@ class MINDDetector(BaseDetector):
         learning_rate: float = 0.001,
         epochs: int = 20,
         batch_size: int = 32,
-        use_entropy_features: bool = True,
         device: str = None,
         **kwargs
     ):
         """
         Args:
             hidden_dims: MLP隐藏层维度
-            dropout: Dropout率
+            dropout: 输入层Dropout率
             learning_rate: 学习率
             epochs: 训练轮数
             batch_size: 批大小
-            use_entropy_features: 是否使用entropy特征
             device: 设备 (cuda/cpu)
         """
         super().__init__(name, **kwargs)
@@ -131,7 +129,6 @@ class MINDDetector(BaseDetector):
         self.learning_rate = learning_rate
         self.epochs = epochs
         self.batch_size = batch_size
-        self.use_entropy_features = use_entropy_features
 
         if TORCH_AVAILABLE:
             self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -139,7 +136,7 @@ class MINDDetector(BaseDetector):
             self.use_torch = True
         else:
             self.device = 'cpu'
-            # sklearn MLP
+            # sklearn MLP (如果无Torch的兜底)
             self.model = MLPClassifier(
                 hidden_layer_sizes=tuple(hidden_dims),
                 activation='relu',
@@ -161,64 +158,26 @@ class MINDDetector(BaseDetector):
 
     def _extract_features(self, accessor: SampleAccessor) -> np.ndarray:
         """
-        提取MIND特征
-
-        特征包括:
-        1. Hidden states (最后层平均池化)
-        2. Token logprobs统计 (可选)
-        3. Entropy (可选)
-
-        Args:
-            accessor: 样本访问器
-
-        Returns:
-            特征向量
+        提取MIND特征:
+        官方源码逻辑 -> d["hd_last_token"] + d["hd_last_mean"]
+        即最后层最后一个Token的隐藏状态，与全局平均隐藏状态的拼接。
         """
-        features = []
-
-        # 1. Hidden states (最后层平均池化)
         try:
-            hidden_state = accessor.get_hidden_states(layer_idx=-1, pooling="mean")
-            features.append(hidden_state)
+            # 分别提取 last pooling 和 mean pooling
+            hidden_state_last = accessor.get_hidden_states(layer_idx=-1, pooling="last")
+            hidden_state_mean = accessor.get_hidden_states(layer_idx=-1, pooling="mean")
+            
+            # 物理拼接，形成如 8192 维的联合特征
+            combined_features = np.concatenate([hidden_state_last, hidden_state_mean])
+            
+            return combined_features
+            
         except Exception as e:
             logger.warning(f"无法获取hidden states: {e}")
-            # 如果没有hidden states,返回零向量
             if self.feature_dim:
                 return np.zeros(self.feature_dim)
             else:
                 raise ValueError("首次提取特征时必须有hidden states")
-
-        # 2. Token logprobs统计 (如果有的话)
-        if self.use_entropy_features:
-            try:
-                logprobs = accessor.get_token_logprobs()
-                if logprobs and len(logprobs) > 0:
-                    logprobs_array = np.array(logprobs)
-
-                    # 统计特征
-                    logprob_features = np.array([
-                        np.mean(logprobs_array),      # 平均log prob
-                        np.std(logprobs_array),       # 标准差
-                        np.min(logprobs_array),       # 最小值
-                        np.max(logprobs_array),       # 最大值
-                    ])
-
-                    # Entropy: -Σ p*log(p)
-                    probs = np.exp(logprobs_array)
-                    entropy = -np.sum(probs * logprobs_array) / len(logprobs_array)
-                    logprob_features = np.append(logprob_features, entropy)
-
-                    features.append(logprob_features)
-                else:
-                    # 没有logprobs,用零填充
-                    features.append(np.zeros(5))
-            except Exception as e:
-                logger.debug(f"无法提取entropy特征: {e}")
-                features.append(np.zeros(5))
-
-        # 拼接所有特征
-        combined = np.concatenate(features)
-        return combined
 
     def fit(self, train_accessors: List[SampleAccessor]) -> None:
         """
@@ -375,36 +334,33 @@ if __name__ == "__main__":
     np.random.seed(42)
 
     class MockAccessor:
-        def __init__(self, sample_id, hidden_state, logprobs, category):
+        def __init__(self, sample_id, hidden_state, category):
             self.sample_id = sample_id
             self.hidden_state = hidden_state
-            self.logprobs = logprobs
             self.metadata = {"eval_category": category}
 
         def get_hidden_states(self, layer_idx=-1, pooling="mean"):
-            return np.mean(self.hidden_state, axis=0)
+            if pooling == "mean":
+                return np.mean(self.hidden_state, axis=0)
+            elif pooling == "last":
+                return self.hidden_state[-1]
+            return self.hidden_state[-1]
 
-        def get_token_logprobs(self):
-            return self.logprobs
-
-    # 测试用例1: Correct (高概率)
+    # 测试用例1: Correct (高分状态)
     print("\n[测试 1] Correct生成")
-    states1 = np.random.randn(10, 128) + 1.0
-    logprobs1 = -0.1 * np.random.rand(10)  # 高概率
-    accessor1 = MockAccessor("test_001", states1, logprobs1, "correct")
+    states1 = np.random.randn(10, 128) + 1.0 # 模拟10个token，隐藏维度128
+    accessor1 = MockAccessor("test_001", states1, "correct")
 
-    # 测试用例2: Hallucination (低概率)
+    # 测试用例2: Hallucination (低分状态)
     print("\n[测试 2] Hallucination生成")
     states2 = np.random.randn(10, 128) - 1.0
-    logprobs2 = -2.0 * np.random.rand(10)  # 低概率
-    accessor2 = MockAccessor("test_002", states2, logprobs2, "hallucination")
+    accessor2 = MockAccessor("test_002", states2, "hallucination")
 
     try:
         detector = MINDDetector(
             name="test_mind",
             hidden_dims=[128, 64],
-            epochs=10,
-            use_entropy_features=True
+            epochs=10
         )
 
         # 训练

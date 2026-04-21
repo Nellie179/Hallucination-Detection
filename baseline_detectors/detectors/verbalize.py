@@ -43,20 +43,24 @@ class VerbalizeDetector(BaseDetector):
 
     def _extract_confidence(self, text: str) -> float:
         """
-        完全参考源码的正则提取逻辑
-        寻找类似 0.8, .8, 80% 或 'Confidence: 0.9' 中的数字
+        强化版正则提取逻辑：
+        寻找类似 0.8, .8, 80%, 1, 0 或 'Confidence: 0.9' 中的数字。
+        解决了原版无法识别单独的 \"1\" 或 \"0\" 的致命 Bug。
         """
         if text is None: return 0.0
         
-        # 匹配 0-1 之间的浮点数或百分比
-        matches = re.findall(r"0?\.\d+|1\.0|100%|\d+%", str(text))
+        # 匹配规则优先级：百分比 > 浮点数 > 单独的 1 或 0 (防止边界值漏抓)
+        matches = re.findall(r"\d+%\.?\d*|0?\.\d+|1\.0|1|0", str(text))
         if not matches:
             return 0.5 # 源码兜底逻辑
         
         last_match = matches[-1] # 通常取最后一个出现的数字
-        if "%" in last_match:
-            return float(last_match.replace("%", "")) / 100.0
-        return float(last_match)
+        try:
+            if "%" in last_match:
+                return float(last_match.replace("%", "")) / 100.0
+            return float(last_match)
+        except ValueError:
+            return 0.5
 
     def predict_score(self, accessor) -> float:
         """

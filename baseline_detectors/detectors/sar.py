@@ -1,446 +1,140 @@
 # baseline_detectors/detectors/sar.py
 """
-SAR (Shifting Attention to Relevance) Detector - 相关性加权不确定性检测器
+SAR (Shifting Attention to Relevance) Detector - 终极安全版
 
 原理：
-    并非所有token都同等重要地代表底层含义,语言冗余使得少数关键词就能传达长句的本质。
-    SAR通过将注意力转移到更相关的成分(token级和句子级)来进行更好的不确定性量化。
+    结合大模型生成的不确定性与语义相关性，重新加权生成的不确定性分数。
 
-方法：
-    1. Token级SAR: 计算每个token的相关性(通过语义相似度),加权token熵
-       - RT(zi, s, x) = 1 - |g(x∪s, x∪s\{zi})| (token移除前后的语义相似度)
-       - ET(zi, sj, x) = -log p(zi|s<i, x) × R̃T(zi, sj, x) (相关性加权熵)
-       - tokenSAR(sj, x) = Σi ET(zi, sj, x)
-
-    2. Sentence级SAR: 计算句子间的相关性,加权句子熵
-       - RS(si, S, x) = Σj≠i g(si, sj)p(sj|x) (与其他高概率句子的语义一致性)
-       - ES(sj, S, x) = -log(p(sj|x) + (1/t)RS(sj, S, x))
-       - sentSAR(S, x) = (1/K) Σk ES(sk, S, x)
-
-    3. 组合SAR: 结合token级和句子级的不确定性
-       - SAR分数越低 → 模型越自信 → 幻觉概率越低
-
-参考文献：
-    Duan et al. "Shifting Attention to Relevance: Towards the Predictive
-    Uncertainty Quantification of Free-Form Large Language Models"
-    ACL 2024
-    https://aclanthology.org/2024.acl-long.276/
-    https://github.com/jinhaoduan/SAR
-
-依赖：
-    numpy, torch, transformers (sentence similarity model)
+工程优化：
+    1. Sentence-SAR 范式：利用大管家缓存的序列级概率。
+    2. NLI 矩阵并行化：大幅提速。
+    3. 数学级防御：引入 LogSumExp 平移，彻底封死无穷大 (inf) 崩溃。
 """
 
+import os
+import math
+import torch
 import numpy as np
 import logging
-from typing import List, Optional
-import sys
-import os
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+from typing import List
 
 from detectors.base import BaseDetector
 from detectors.registry import register_detector
 from data_utils.accessor import SampleAccessor
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 延迟导入,避免在没有安装transformers时报错
+# 尝试导入 sentence_transformers
 try:
-    from sentence_transformers import SentenceTransformer, util
-    SENTENCE_TRANSFORMER_AVAILABLE = True
+    from sentence_transformers.cross_encoder import CrossEncoder
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
 except ImportError:
-    logger.warning("sentence-transformers未安装,SAR将使用简化版本(基于token概率)")
-    SENTENCE_TRANSFORMER_AVAILABLE = False
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
+    logger.warning("未安装 sentence_transformers，SAR 探针将无法工作。")
 
 
 @register_detector("sar")
 class SARDetector(BaseDetector):
-    """
-    SAR (Shifting Attention to Relevance) 检测器
-
-    需要数据：
-        - token_logprobs（token级对数概率）- Blackbox/Whitebox 均可
-        - 可选: 多个生成样本（用于句子级SAR）
-    """
-
     def __init__(
-            self,
-            name: str,
-            use_token_level: bool = True,
-            use_sentence_level: bool = False,
-            similarity_model: str = "all-MiniLM-L6-v2",
-            temperature: float = 1.0,
-            epsilon: float = 1e-10,
-            **kwargs
+        self, 
+        name="sar", 
+        measurement_model: str = "cross-encoder/stsb-distilroberta-base",
+        t: float = 0.001,
+        device: str = None,
+        **kwargs
     ):
-        """
-        Args:
-            use_token_level: 是否使用token级SAR（默认True）
-            use_sentence_level: 是否使用sentence级SAR（需要多个生成样本,默认False）
-            similarity_model: 用于计算语义相似度的模型（默认使用轻量级模型）
-            temperature: 句子级SAR的温度参数（控制相关性转移的尺度）
-            epsilon: 用于数值稳定性的小常数
-        """
         super().__init__(name, **kwargs)
+        self.requires_stochastic = True
+        self.t = t
+        
+        if not SENTENCE_TRANSFORMERS_AVAILABLE:
+            raise ImportError("SAR 必须依赖 sentence_transformers。请执行: pip install sentence_transformers")
 
-        self.use_token_level = use_token_level
-        self.use_sentence_level = use_sentence_level
-        self.temperature = temperature
-        self.epsilon = epsilon
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info(f"[{self.name}] 加载 NLI 模型: {measurement_model} 到 {self.device}")
+        self.measure_model = CrossEncoder(model_name=measurement_model, device=self.device, num_labels=1)
 
-        # 初始化语义相似度模型（如果需要）
-        self.similarity_model = None
-        if SENTENCE_TRANSFORMER_AVAILABLE and (use_token_level or use_sentence_level):
-            try:
-                self.similarity_model = SentenceTransformer(similarity_model)
-                logger.info(f"[{self.name}] 加载语义相似度模型: {similarity_model}")
-            except Exception as e:
-                logger.warning(f"[{self.name}] 无法加载语义模型: {e}, 将使用简化版本")
-
-        # 统计信息（用于归一化）
-        self.sar_mean = None
-        self.sar_std = None
-
-        logger.info(f"[{self.name}] SAR检测器初始化完成")
-        logger.info(f"  Token级SAR: {use_token_level}")
-        logger.info(f"  Sentence级SAR: {use_sentence_level}")
-        logger.info(f"  温度参数: {temperature}")
-
-    def _compute_semantic_similarity(self, text1: str, text2: str) -> float:
+    def _semantic_weighted_log(self, similarities: List[List[float]], entropies: torch.Tensor) -> torch.Tensor:
         """
-        计算两个文本的语义相似度 g(text1, text2)
-
-        Args:
-            text1: 第一个文本
-            text2: 第二个文本
-
-        Returns:
-            相似度分数 [0, 1]
+        [数学防御核心] LogSumExp 平移技巧，彻底杜绝 exp() 下溢引发的 log(0)=inf 报错
         """
-        if self.similarity_model is not None:
-            try:
-                embeddings = self.similarity_model.encode([text1, text2])
-                similarity = util.cos_sim(embeddings[0], embeddings[1]).item()
-                # 转换到 [0, 1] 范围
-                return (similarity + 1.0) / 2.0
-            except Exception as e:
-                logger.warning(f"语义相似度计算失败: {e}")
-                return 0.5
-        else:
-            # 简化版本: 使用Jaccard相似度
-            tokens1 = set(text1.lower().split())
-            tokens2 = set(text2.lower().split())
-            if not tokens1 or not tokens2:
-                return 0.0
-            intersection = len(tokens1 & tokens2)
-            union = len(tokens1 | tokens2)
-            return intersection / union if union > 0 else 0.0
-
-    def _compute_token_relevance(
-            self,
-            tokens: List[str],
-            token_idx: int,
-            full_text: str,
-            prompt: str = ""
-    ) -> float:
-        """
-        计算token的相关性 RT(zi, s, x)
-        RT(zi, s, x) = 1 - |g(x∪s, x∪s\{zi})|
-
-        Args:
-            tokens: token列表
-            token_idx: 当前token的索引
-            full_text: 完整文本
-            prompt: 输入提示
-
-        Returns:
-            相关性分数 [0, 1]
-        """
-        # 构造移除当前token后的文本
-        tokens_without_current = tokens[:token_idx] + tokens[token_idx + 1:]
-        text_without_token = " ".join(tokens_without_current)
-
-        # 如果有prompt,与prompt拼接
-        if prompt:
-            full_with_prompt = prompt + " " + full_text
-            without_token_with_prompt = prompt + " " + text_without_token
-        else:
-            full_with_prompt = full_text
-            without_token_with_prompt = text_without_token
-
-        # 计算移除token前后的语义相似度
-        similarity = self._compute_semantic_similarity(
-            full_with_prompt,
-            without_token_with_prompt
-        )
-
-        # RT = 1 - similarity (相似度越低,说明token越重要)
-        relevance = 1.0 - abs(similarity)
-
-        return max(0.0, min(1.0, relevance))  # 确保在[0,1]范围内
-
-    def _compute_token_level_sar(
-            self,
-            tokens: List[str],
-            token_logprobs: np.ndarray,
-            full_text: str,
-            prompt: str = ""
-    ) -> float:
-        """
-        计算Token级SAR
-        tokenSAR(sj, x) = Σi ET(zi, sj, x)
-        其中 ET(zi, sj, x) = -log p(zi|s<i, x) × R̃T(zi, sj, x)
-
-        Args:
-            tokens: token列表
-            token_logprobs: token对数概率数组
-            full_text: 完整文本
-            prompt: 输入提示
-
-        Returns:
-            Token级SAR分数
-        """
-        if len(tokens) == 0 or len(token_logprobs) == 0:
-            return 0.0
-
-        # 1. 计算每个token的相关性 RT
-        relevances = []
-        for i in range(len(tokens)):
-            relevance = self._compute_token_relevance(tokens, i, full_text, prompt)
-            relevances.append(relevance)
-
-        relevances = np.array(relevances)
-
-        # 2. 归一化相关性 R̃T (使得在句子内可比较)
-        relevance_sum = np.sum(relevances)
-        if relevance_sum < self.epsilon:
-            # 所有token相关性都很低,使用均匀权重
-            normalized_relevances = np.ones(len(relevances)) / len(relevances)
-        else:
-            normalized_relevances = relevances / relevance_sum
-
-        # 3. 计算加权token熵 ET
-        # ET(zi) = -log p(zi) × R̃T(zi)
-        # 注意: token_logprobs 已经是 log概率, 所以 -log p = -logprob
-        token_entropies = -token_logprobs * normalized_relevances
-
-        # 4. 求和得到token级SAR
-        token_sar = np.sum(token_entropies)
-
-        return float(token_sar)
-
-    def fit(self, train_accessors: List[SampleAccessor]) -> None:
-        """
-        计算训练集上的SAR统计信息（用于归一化幻觉分数）
-        """
-        logger.info(f"[{self.name}] 开始计算训练集SAR统计...")
-
-        sar_scores = []
-        for accessor in train_accessors:
-            try:
-                score = self._compute_sar_score(accessor)
-                if not np.isnan(score) and not np.isinf(score):
-                    sar_scores.append(score)
-            except Exception as e:
-                logger.warning(f"Sample {accessor.sample_id}: SAR计算失败: {e}")
-                continue
-
-        if not sar_scores:
-            logger.warning(f"[{self.name}] 训练集没有有效的SAR数据，使用默认归一化参数")
-            self.sar_mean = 5.0
-            self.sar_std = 2.0
-        else:
-            self.sar_mean = np.mean(sar_scores)
-            self.sar_std = np.std(sar_scores)
-            if self.sar_std < self.epsilon:
-                self.sar_std = 1.0  # 避免除零
-
-            logger.info(f"[{self.name}] SAR统计:")
-            logger.info(f"  均值: {self.sar_mean:.4f}")
-            logger.info(f"  标准差: {self.sar_std:.4f}")
-            logger.info(f"  最小值: {np.min(sar_scores):.4f}")
-            logger.info(f"  最大值: {np.max(sar_scores):.4f}")
-
-    def _compute_sar_score(self, accessor: SampleAccessor) -> float:
-        """
-        计算原始SAR分数（未归一化）
-
-        Returns:
-            SAR分数（越高表示越不确定,幻觉可能性越大）
-        """
-        # 获取tokens和对数概率
-        tokens = accessor.get_tokens()
-        token_logprobs = accessor.get_token_logprobs()
-
-        if len(tokens) == 0 or len(token_logprobs) == 0:
-            return 0.0
-
-        # 获取完整文本和提示
-        full_text = accessor.get_answer()
-        prompt = accessor.get_question() if hasattr(accessor, 'get_question') else ""
-
-        # 只使用token级SAR（简化版本）
-        if self.use_token_level:
-            sar_score = self._compute_token_level_sar(
-                tokens, token_logprobs, full_text, prompt
-            )
-        else:
-            # 如果不使用token级,使用简单的平均负对数概率
-            sar_score = -np.mean(token_logprobs)
-
-        return sar_score
+        # entropies 是正数（因为负对数概率取反了），我们需要还原成负数对数概率
+        log_probs = -1 * entropies
+        
+        # 提取最大对数概率作为平移基准，防止集体下溢
+        max_log_prob = log_probs.max()
+        if torch.isinf(max_log_prob):
+            return torch.zeros_like(entropies)
+            
+        shifted_log_probs = log_probs - max_log_prob
+        shifted_probs = torch.exp(shifted_log_probs)
+        
+        weighted_entropy = []
+        for idx, (prob, ent) in enumerate(zip(shifted_probs, entropies)):
+            sim_tensor = torch.tensor(similarities[idx], device=self.device)
+            # 强力清洗：消除 NLI 模型偶尔吐出的诡异 NaN/Inf
+            sim_tensor = torch.nan_to_num(sim_tensor, nan=0.0, posinf=1.0, neginf=-1.0)
+            
+            other_probs = torch.cat([shifted_probs[:idx], shifted_probs[idx + 1:]])
+            
+            # SAR 核心计算
+            sum_term = prob + ((sim_tensor / self.t) * other_probs).sum()
+            
+            # 强力钳制：底线保护，绝不给 log() 喂 <= 0 的数字
+            sum_term = torch.clamp(sum_term, min=1e-10)
+            
+            # 还原平移公式
+            w_ent = -(torch.log(sum_term) + max_log_prob)
+            weighted_entropy.append(w_ent)
+            
+        return torch.tensor(weighted_entropy, device=self.device)
 
     def predict_score(self, accessor: SampleAccessor) -> float:
-        """
-        计算幻觉分数
+        # 【临时移除 try-except，让报错直接把程序炸停，我们看 trace！】
+        prompt = accessor.get_prompt_text()
+        raw_samples = accessor.get_stochastic_samples()
+        raw_logprobs = accessor.get_stochastic_logprobs()
 
-        返回值：
-            float: 幻觉概率 [0, 1]
-                   SAR分数越高 → 不确定性越高 → 幻觉概率越高
-        """
-        try:
-            # 计算SAR分数
-            sar_score = self._compute_sar_score(accessor)
+        # Debug 1: 检查大管家到底有没有给你送来数据
+        if not raw_samples or not raw_logprobs:
+            logger.error(f"[SAR 致命拦截] 样本 {accessor.sample_id} 根本没有采样数据或概率！")
+            logger.error(f"  - raw_samples 长度: {len(raw_samples) if raw_samples else 'None'}")
+            logger.error(f"  - raw_logprobs 长度: {len(raw_logprobs) if raw_logprobs else 'None'}")
+            return 0.5
+            
+        samples, logprobs = [], []
+        for s, lp in zip(raw_samples, raw_logprobs):
+            if lp is not None and not math.isnan(lp) and not math.isinf(lp):
+                samples.append(s)
+                logprobs.append(float(lp))
+                
+        num_generations = len(samples)
+        if num_generations <= 1:
+            logger.error(f"[SAR 致命拦截] 样本 {accessor.sample_id} 有效采样数不足 2 个，无法计算。")
+            return 0.5 
 
-            if np.isnan(sar_score) or np.isinf(sar_score):
-                logger.warning(f"Sample {accessor.sample_id}: SAR计算结果无效")
-                return float('nan')
+        # Debug 2: 确认接下来进入张量计算阶段
+        print(f"[*] 样本 {accessor.sample_id} 数据校验通过 (Generations: {num_generations})，准备执行张量计算...")
 
-            # 归一化SAR分数到幻觉概率 [0, 1]
-            # SAR分数越高，幻觉分数越高
-            if self.sar_mean is not None and self.sar_std is not None:
-                # Z-score 归一化，然后映射到 [0, 1]
-                z_score = (sar_score - self.sar_mean) / self.sar_std
-                # 使用 sigmoid 映射：高SAR → 高分数
-                hallucination_score = 1.0 / (1.0 + np.exp(-z_score))
-            else:
-                # 未训练的情况，使用简单映射
-                # 假设SAR分数通常在 0-10 之间
-                hallucination_score = min(sar_score / 10.0, 1.0)
+        gen_entropies = torch.tensor([-lp for lp in logprobs], dtype=torch.float32, device=self.device)
 
-            return float(hallucination_score)
+        pairs = []
+        pair_indices = []
+        for i in range(num_generations):
+            for j in range(i + 1, num_generations):
+                pairs.append([prompt + samples[i], prompt + samples[j]])
+                pair_indices.append((i, j))
 
-        except Exception as e:
-            logger.error(f"Sample {accessor.sample_id}: SAR 计算失败: {e}")
-            return float('nan')
+        # 这里如果报错，通常是 CrossEncoder 遇到超长文本 (大于 512 token) 或 OOM
+        flat_similarities = self.measure_model.predict(pairs, show_progress_bar=False)
 
-    def analyze(self, accessor: SampleAccessor) -> dict:
-        """详细分析（调试用）"""
-        try:
-            tokens = accessor.get_tokens()
-            token_logprobs = accessor.get_token_logprobs()
-            full_text = accessor.get_answer()
+        similarities = {i: [] for i in range(num_generations)}
+        for (i, j), sim_score in zip(pair_indices, flat_similarities):
+            similarities[i].append(float(sim_score))
+            similarities[j].append(float(sim_score))
 
-            sar_score = self._compute_sar_score(accessor)
-
-            # 计算token相关性分布
-            relevances = []
-            for i in range(min(len(tokens), 10)):  # 只分析前10个token
-                relevance = self._compute_token_relevance(
-                    tokens, i, full_text, ""
-                )
-                relevances.append(relevance)
-
-            return {
-                "num_tokens": len(tokens),
-                "sar_score": float(sar_score),
-                "sar_mean": float(self.sar_mean) if self.sar_mean is not None else None,
-                "sar_std": float(self.sar_std) if self.sar_std is not None else None,
-                "avg_token_logprob": float(np.mean(token_logprobs)),
-                "token_relevances_sample": relevances,  # 前10个token的相关性
-                "tokens_sample": tokens[:10],  # 前10个token
-                "hallucination_score": self.predict_score(accessor)
-            }
-
-        except Exception as e:
-            return {"error": str(e)}
-
-
-# ==========================================
-# 测试代码
-# ==========================================
-if __name__ == "__main__":
-    print("=" * 70)
-    print("SAR (Shifting Attention to Relevance) Detector 单元测试")
-    print("=" * 70)
-
-    # 创建模拟数据
-    np.random.seed(42)
-
-    class MockAccessor:
-        def __init__(self, sample_id, tokens, token_logprobs, answer):
-            self.sample_id = sample_id
-            self._tokens = tokens
-            self._token_logprobs = token_logprobs
-            self._answer = answer
-
-        def get_tokens(self):
-            return self._tokens
-
-        def get_token_logprobs(self):
-            return self._token_logprobs
-
-        def get_answer(self):
-            return self._answer
-
-        def get_question(self):
-            return "What is the capital of France?"
-
-    # 测试用例 1：高置信度回答（低不确定性，低幻觉）
-    print("\n[测试 1] 高置信度生成（期望：低幻觉分数）")
-    tokens1 = ["The", "capital", "of", "France", "is", "Paris", "."]
-    logprobs1 = np.array([-0.1, -0.2, -0.1, -0.15, -0.1, -0.2, -0.1])  # 高置信度
-    answer1 = "The capital of France is Paris."
-    accessor1 = MockAccessor("test_001", tokens1, logprobs1, answer1)
-
-    # 测试用例 2：低置信度回答（高不确定性，高幻觉）
-    print("\n[测试 2] 低置信度生成（期望：高幻觉分数）")
-    tokens2 = ["The", "capital", "might", "possibly", "be", "Rome", "or", "Berlin", "?"]
-    logprobs2 = np.array([-0.5, -1.2, -2.5, -2.0, -1.5, -3.0, -2.0, -2.5, -1.0])  # 低置信度
-    answer2 = "The capital might possibly be Rome or Berlin?"
-    accessor2 = MockAccessor("test_002", tokens2, logprobs2, answer2)
-
-    try:
-        detector = SARDetector(
-            name="test_sar",
-            use_token_level=True,
-            use_sentence_level=False
-        )
-
-        # 模拟训练（使用两个样本）
-        print("\n训练SAR检测器...")
-        detector.fit([accessor1, accessor2])
-
-        # 测试 1
-        print("\n" + "=" * 70)
-        score1 = detector.predict_score(accessor1)
-        analysis1 = detector.analyze(accessor1)
-        print(f"样本1 - 幻觉分数: {score1:.3f}")
-        print(f"  SAR分数: {analysis1['sar_score']:.3f}")
-        print(f"  平均log概率: {analysis1['avg_token_logprob']:.3f}")
-        print(f"  Tokens: {analysis1['tokens_sample']}")
-
-        # 测试 2
-        print("\n" + "=" * 70)
-        score2 = detector.predict_score(accessor2)
-        analysis2 = detector.analyze(accessor2)
-        print(f"样本2 - 幻觉分数: {score2:.3f}")
-        print(f"  SAR分数: {analysis2['sar_score']:.3f}")
-        print(f"  平均log概率: {analysis2['avg_token_logprob']:.3f}")
-        print(f"  Tokens: {analysis2['tokens_sample']}")
-
-        print("\n" + "=" * 70)
-        print("✅ 测试完成")
-        print(f"预期：高置信度样本分数 ({score1:.3f}) < 低置信度样本分数 ({score2:.3f})")
-
-        if score1 < score2:
-            print("✓ 结果符合预期！")
-        else:
-            print("✗ 结果不符合预期，可能需要调整参数")
-
-    except Exception as e:
-        print(f"\n❌ 测试失败: {e}")
-        import traceback
-        traceback.print_exc()
+        # 这里如果报错，说明自定义的数学函数张量维度不匹配
+        sar_scores = self._semantic_weighted_log(similarities, gen_entropies)
+        final_score = float(sar_scores.mean().cpu().item())
+        
+        return final_score

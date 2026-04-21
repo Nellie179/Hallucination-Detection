@@ -19,6 +19,7 @@ if utils_dir not in sys.path: sys.path.insert(0, utils_dir)
 
 # 纯净导入
 from datasets_v1.generate_stochastic_samples import StochasticExtractor
+from datasets_v1.generate_auxiliary_evals import AuxiliaryEvaluator
 from data_utils.accessor import SampleAccessor
 from baseline_detectors.evaluators.classification import ClassificationEvaluator
 from data_utils.extract_qa_hidden_states import process_dataset
@@ -28,13 +29,13 @@ from data_utils.data_split import split_dataset
 # 💎 评测全局配置中枢
 # ==========================================
 EVAL_CONFIG = {
-    "num_samples": 3,
-    "max_new_tokens": 256,
+    "num_samples": 5,
+    "max_new_tokens": 2048,
     "system_prompt": "You are a helpful, accurate, and honest AI assistant.",
     "num_shots": 4, 
     "layer_config": {"mode": "middle", "count": 5},
     "token_config": {"mode": "backward", "count": 5},
-    "stochastic_gen_kwargs": {"temperature": 0.8, "top_p": 0.9},
+    "stochastic_gen_kwargs": {"num_beams": 5, "do_sample": True, "temperature": 1.0},
     "template_kwargs": {"enable_thinking": False},
     "model_kwargs": {"trust_remote_code": True, "attn_implementation": "sdpa"}
 }
@@ -47,11 +48,6 @@ def validate_stochastic_cache(jsonl_path: str, active_detectors: list, expected_
     required_keys = ["sample_id"]
     if any(getattr(d, "requires_stochastic", False) for d in active_detectors):
         required_keys.append("stochastic_samples")
-    if any(d.name == "verbalize" for d in active_detectors):
-        required_keys.append("verbalize_response")
-    if any(d.name == "self_evaluator" for d in active_detectors):
-        # 🛠️ [修改位置]: 修复了校验器的字段对账，改为真实的 self_evaluator_raw
-        required_keys.append("self_evaluator_raw")
         
     try:
         valid_count = 0
@@ -74,6 +70,38 @@ def validate_stochastic_cache(jsonl_path: str, active_detectors: list, expected_
         return True
     except Exception as e:
         print(f"[-] 缓存文件损坏或解析异常: {e}")
+        return False
+
+def validate_aux_cache(jsonl_path: str, active_detectors: list, expected_total: int) -> bool:
+    """校验 auxiliary eval 缓存文件完整性。"""
+    if not os.path.exists(jsonl_path):
+        return False
+
+    required_keys = ["sample_id"]
+    if any(d.name == "verbalize" for d in active_detectors):
+        required_keys.append("verbalize_response")
+    if any(d.name == "self_evaluator" for d in active_detectors):
+        required_keys.append("self_evaluator_raw")
+
+    try:
+        valid_count = 0
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                data = json.loads(line)
+                if not all(k in data for k in required_keys):
+                    print(f"[-] Auxiliary 缓存失效: 样本 {data.get('sample_id')} 缺失关键字段，当前要求包含 {required_keys}")
+                    return False
+                valid_count += 1
+
+        if valid_count < expected_total:
+            print(f"[-] Auxiliary 缓存失效: 样本数量不匹配 (当前缓存 {valid_count} 个，预期需要 {expected_total} 个)")
+            return False
+
+        return True
+    except Exception as e:
+        print(f"[-] Auxiliary 缓存文件损坏或解析异常: {e}")
         return False
 
 def get_detector(name: str):
@@ -101,7 +129,7 @@ def get_detector(name: str):
     module = __import__(f"detectors.{module_path}", fromlist=[class_name])
     return getattr(module, class_name)(name=name)
 
-def build_accessors(jsonl_path, base_h5, st_dict, st_h5, recovery_dict):
+def build_accessors(jsonl_path, base_h5, st_dict, st_h5, recovery_dict, aux_dict=None):
     accessors = []
     if not os.path.exists(jsonl_path): return accessors
     
@@ -110,13 +138,13 @@ def build_accessors(jsonl_path, base_h5, st_dict, st_h5, recovery_dict):
             meta = json.loads(line)
             sid = str(meta["sample_id"])
             
-            # 🛠️ [修改位置]: 将 st_dict 中的专属打分挂载到 metadata，满足白盒/黑盒探测器的读取需求
-            if st_dict and sid in st_dict:
-                if st_dict[sid].get("verbalize_response") is not None:
-                    meta["verbalize_response"] = st_dict[sid]["verbalize_response"]
-                if st_dict[sid].get("self_evaluator_raw") is not None:
-                    meta["self_evaluator_raw"] = st_dict[sid]["self_evaluator_raw"]
-                    meta["self_evaluator_response"] = st_dict[sid]["self_evaluator_raw"]
+            # 🛠️ [修改位置]: verbalize / self_evaluator 改为从独立 aux_dict 挂载到 metadata
+            if aux_dict and sid in aux_dict:
+                if aux_dict[sid].get("verbalize_response") is not None:
+                    meta["verbalize_response"] = aux_dict[sid]["verbalize_response"]
+                if aux_dict[sid].get("self_evaluator_raw") is not None:
+                    meta["self_evaluator_raw"] = aux_dict[sid]["self_evaluator_raw"]
+                    meta["self_evaluator_response"] = aux_dict[sid]["self_evaluator_raw"]
             
             acc = SampleAccessor(
                 sample_id=sid, metadata=meta, 
@@ -133,7 +161,7 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
     
     need_stochastic = any(getattr(d, "requires_stochastic", False) for d in active_detectors)
     need_stochastic_hs = any(getattr(d, "requires_stochastic_hidden_states", False) for d in active_detectors)
-    need_realtime_eval = any(name in ["verbalize", "self_evaluator"] for name in baselines)
+    need_aux_eval = any(name in ["verbalize", "self_evaluator"] for name in baselines)
     need_logprobs = any(getattr(d, "requires_logprobs", False) for d in active_detectors)
 
     for target_model in target_models:
@@ -154,6 +182,7 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
 
             st_jsonl_path = os.path.join(exp_dir, "04_stochastic_samples.jsonl")
             st_h5_path = os.path.join(exp_dir, "04_stochastic_hidden_states.h5")
+            aux_jsonl_path = os.path.join(exp_dir, "04_auxiliary_evals.jsonl")
             base_h5_path = os.path.join(exp_dir, "02_hidden_states.h5")
             recovery_h5_path = os.path.join(exp_dir, "05_qa_features_base_logit_recovery.h5") 
             final_report_path = os.path.join(exp_dir, "06_evaluation_results.json")
@@ -161,8 +190,8 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
             with open(base_meta_path, 'r', encoding='utf-8') as f_meta:
                 expected_total = sum(1 for _ in f_meta)
 
-            # 【阶段 1】采样引擎
-            if need_stochastic or need_realtime_eval:
+            # 【阶段 1】采样引擎（只服务真正需要多次采样的方法）
+            if need_stochastic:
                 print(f"[*] 执行阶段 1 缓存完整性校验...")
                 is_cache_valid = validate_stochastic_cache(st_jsonl_path, active_detectors, expected_total)
                 
@@ -180,13 +209,39 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
                         max_new_tokens=EVAL_CONFIG["max_new_tokens"], num_samples=EVAL_CONFIG["num_samples"],
                         system_prompt=EVAL_CONFIG["system_prompt"], num_shots=EVAL_CONFIG["num_shots"],
                         generation_kwargs=EVAL_CONFIG["stochastic_gen_kwargs"], template_kwargs=EVAL_CONFIG["template_kwargs"],
-                        run_verbalize=("verbalize" in baselines), run_self_evaluator=("self_evaluator" in baselines),
+                        run_verbalize=False, run_self_evaluator=False,
                         extract_stochastic_hs=need_stochastic_hs
                     )
                     del extractor
                     torch.cuda.empty_cache()
                 else:
                     print(f"[+] 采样缓存校验通过！完全满足当前 {len(active_detectors)} 个探测器的严苛要求，直接复用。")
+
+            # 【阶段 1.2】auxiliary eval 引擎（verbalize / self_evaluator 独立生成）
+            if need_aux_eval:
+                print(f"[*] 执行阶段 1.2 Auxiliary 缓存完整性校验...")
+                is_aux_cache_valid = validate_aux_cache(aux_jsonl_path, active_detectors, expected_total)
+
+                if not is_aux_cache_valid:
+                    print(f"[!] Auxiliary 校验未通过：即将启动独立生成引擎...")
+                    if os.path.exists(aux_jsonl_path):
+                        os.remove(aux_jsonl_path)
+                        print(f"  - 已清理历史脏数据: {os.path.basename(aux_jsonl_path)}")
+
+                    aux_evaluator = AuxiliaryEvaluator(model_name=target_model, model_kwargs=EVAL_CONFIG["model_kwargs"])
+                    aux_evaluator.process_auxiliary_from_file(
+                        input_jsonl_path=base_meta_path,
+                        output_jsonl_path=aux_jsonl_path,
+                        system_prompt=EVAL_CONFIG["system_prompt"],
+                        num_shots=EVAL_CONFIG["num_shots"],
+                        template_kwargs=EVAL_CONFIG["template_kwargs"],
+                        run_verbalize=("verbalize" in baselines),
+                        run_self_evaluator=("self_evaluator" in baselines),
+                    )
+                    del aux_evaluator
+                    torch.cuda.empty_cache()
+                else:
+                    print(f"[+] Auxiliary 缓存校验通过！直接复用。")
 
             # 【阶段 1.5】全自动造子弹
             if need_logprobs and not os.path.exists(recovery_h5_path):
@@ -208,14 +263,19 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
                                 if not all_keys or len(all_keys) < expected_total:
                                     print(f"[*] 发现 {det.name} 特征不完整 (当前 {len(all_keys)} 个，预期 {expected_total} 个)！准备重跑...")
                                     need_extract = True
+                                
                                 else:
                                     sample_grp = f_check[all_keys[0]]
-                                    if det.name == "icr_probe" and "icr_feature" not in sample_grp:
+                                    if det.name == "self_evaluator" and "logprobs" not in sample_grp:
+                                        print(f"[*] 检测到 {det.name} 缺失对数概率 (logprobs)，准备重跑...")
+                                        need_extract = True
+                                    elif det.name == "icr_probe" and "icr_feature" not in sample_grp:
                                         print(f"[*] 检测到 {det.name} 核心字段缺失，准备重跑...")
                                         need_extract = True
                                     elif det.name == "sep" and "sep_points" not in sample_grp:
                                         print(f"[*] 检测到 {det.name} 核心字段缺失 (sep_points)，准备重跑...")
                                         need_extract = True
+                                
                         except Exception as e:
                             print(f"[*] 发现 {det.name} 特征文件已损坏，准备重跑提取...")
                             need_extract = True
@@ -232,10 +292,17 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
                 with open(st_jsonl_path, 'r', encoding='utf-8') as f:
                     for line in f:
                         d = json.loads(line)
-                        # 🛠️ [修改位置]: 确保把 verbalize_response 和 self_evaluator_raw 也读进内存
                         st_dict[str(d["sample_id"])] = {
                             "samples": d.get("stochastic_samples", []), 
-                            "log_likelihoods": d.get("stochastic_log_likelihoods", []),
+                            "log_likelihoods": d.get("stochastic_log_likelihoods", [])
+                        }
+
+            aux_dict = {}
+            if os.path.exists(aux_jsonl_path):
+                with open(aux_jsonl_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        d = json.loads(line)
+                        aux_dict[str(d["sample_id"])] = {
                             "verbalize_response": d.get("verbalize_response"),
                             "self_evaluator_raw": d.get("self_evaluator_raw")
                         }
@@ -259,8 +326,8 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
                     if os.path.exists(qa_path): qa_h5_handles[det.name] = h5py.File(qa_path, 'r')
 
             # 🚀 按花名册提人
-            train_accessors = build_accessors(train_meta_path, base_h5, st_dict, st_h5, recovery_dict)
-            test_accessors = build_accessors(test_meta_path, base_h5, st_dict, st_h5, recovery_dict)
+            train_accessors = build_accessors(train_meta_path, base_h5, st_dict, st_h5, recovery_dict, aux_dict)
+            test_accessors = build_accessors(test_meta_path, base_h5, st_dict, st_h5, recovery_dict, aux_dict)
 
             print(f"[*] 数据隔离完毕。Train: {len(train_accessors)} 个 | Test: {len(test_accessors)} 个")
 
@@ -306,34 +373,36 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
 
 if __name__ == "__main__":
     run_benchmark(
-        target_models=["meta-llama/Llama-3.1-8B-Instruct"],
-        datasets=[
-            "truthful_qa",
-            "halueval_qa",
-            "trivia_qa",
-            "coqa",
-            "squad_v2",
-            "arc_challenge",
-            "xsum",
-            "gsm8k",
-            "human_eval",
-            "xlam_agent",
-            "mbpp"
+        target_models=["meta-llama/Llama-3.2-3B-Instruct"],
+        datasets=[ "belebele"
+            # "truthful_qa",
+            # "halueval_qa",
+            # "trivia_qa",
+            # "coqa",
+            # "squad_v2",
+            # "arc_challenge",
+            # "xsum",
+            # "gsm8k",
+            # "human_eval",
+            # "xlam_agent",
+            # "mbpp"
         ],
         baselines=[
-            "selfcheck_bertscore",
-            "selfcheck_nli",
+            # "selfcheck_bertscore",
+            # "selfcheck_nli",
             "semantic_entropy",
-            "lexical_similarity",
-            "verbalize",
-            "self_evaluator",
-            "perplexity",
-            "ln_entropy",
-            "eigenscore_internal",
-            "ccs",
-            "prism",
-            "saplma",
+            # "lexical_similarity",
+            #  "verbalize",
+            # "self_evaluator",
+            # "perplexity",
+            # "ln_entropy",
+            # "eigenscore_internal",
+            # "ccs",
+            # "prism",
+            # "saplma",
             "sep",
-            "icr_probe", ### 这一个如果太慢你可以先注释了，我优化完再跑
+            # "icr_probe",
+            # "mind",
+            "sar"
         ] 
     )
