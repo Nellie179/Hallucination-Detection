@@ -17,8 +17,31 @@ class AuxiliaryEvaluator(HiddenStateExtractor):
     不做 stochastic sampling
     不提取 hidden states
     不写 H5
+    🚀 [重构版]：全面支持全局依赖注入 (Dependency Injection)，共享显存池。
     """
 
+    def __init__(self, model_name=None, model=None, tokenizer=None, model_kwargs=None):
+        """
+        🚀 [重构核心]: 依赖注入支持
+        """
+        if model is not None and tokenizer is not None:
+            self.model_name = model_name or "injected_model"
+            self.model = model
+            self.tokenizer = tokenizer
+            self.device = next(model.parameters()).device
+            self.model_kwargs = model_kwargs or {}
+            
+            # ==========================================
+            # 🚨 [热修复补丁]: 保持与父类严格一致的属性完整性
+            # ==========================================
+            if hasattr(self.model.config, "num_hidden_layers"):
+                self.total_layers = self.model.config.num_hidden_layers
+            else:
+                self.total_layers = self.model.config.text_config.num_hidden_layers
+
+            print(f"[*] AuxiliaryEvaluator 成功接收指挥官注入的模型实例 (设备: {self.device})")
+        else:
+            super().__init__(model_name, model_kwargs)
     def generate_single_response(self, prompt: str, max_new_tokens: int = 100) -> str:
         """贪婪解码，和你现在 StochasticExtractor 里的行为保持一致。"""
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)

@@ -14,7 +14,7 @@ from hidden_state import HiddenStateExtractor
 from prompt_builder import LLMPromptBuilder
 
 # ==========================================
-# 异步 I/O 专职子进程 (完美复刻你的原始设计)
+# 异步 I/O 专职子进程
 # ==========================================
 def stochastic_hdf5_writer_worker(data_queue, h5_filepath, jsonl_filepath, extract_hs):
     print(f"[Writer Process] 采样数据落盘进程已启动 (PID: {os.getpid()}).")
@@ -64,10 +64,33 @@ def stochastic_hdf5_writer_worker(data_queue, h5_filepath, jsonl_filepath, extra
 class StochasticExtractor(HiddenStateExtractor):
     """
     继承自原生的 HiddenStateExtractor！
-    复用多模态绕过加载逻辑、层级解析逻辑。
-    专注于多次并发采样与 hidden-state 提取，并封装了全流程。
+    支持依赖注入模式：可直接接收外部传入的 model 实例，跳过重复加载。
     """
     
+    def __init__(self, model_name=None, model=None, tokenizer=None, model_kwargs=None):
+        """
+        🚀 [重构核心]: 依赖注入支持
+        """
+        if model is not None and tokenizer is not None:
+            self.model_name = model_name or "injected_model"
+            self.model = model
+            self.tokenizer = tokenizer
+            self.device = next(model.parameters()).device
+            self.model_kwargs = model_kwargs or {}
+            
+            # ==========================================
+            # 🚨 [热修复补丁]: 补上缺失的模型层数推断
+            # ==========================================
+            if hasattr(self.model.config, "num_hidden_layers"):
+                self.total_layers = self.model.config.num_hidden_layers
+            else:
+                self.total_layers = self.model.config.text_config.num_hidden_layers
+
+            print(f"[*] StochasticExtractor 成功接收指挥官注入的模型实例 (设备: {self.device})")
+        else:
+            # 兼容老版本，如果没有注入，则调用父类去加载
+            super().__init__(model_name, model_kwargs)
+
     def generate_and_extract_stochastic(self, prompt, layer_config, token_config, max_new_tokens, num_samples, generation_kwargs=None):
         target_layers = self._resolve_target_layers(layer_config)
         gen_kwargs = generation_kwargs or {}
@@ -118,7 +141,7 @@ class StochasticExtractor(HiddenStateExtractor):
 
             token_logprobs = []
             if transition_scores is not None and total_generated > 0:
-                # 🚨 终极防御：提取概率时进行安全钳制，杜绝一切由于极其冷门词汇引发的 Inf 和 NaN
+                # 🚨 终极防御：提取概率时进行安全钳制
                 for s in transition_scores[0, :total_generated].cpu().numpy():
                     val = float(s)
                     if math.isinf(val) or math.isnan(val):
@@ -140,7 +163,6 @@ class StochasticExtractor(HiddenStateExtractor):
                     layer_tensors.append(torch.stack(step_tensors))
 
                 mega_tensor_gpu = torch.stack(layer_tensors)
-                # 完美继承：优雅的 bfloat16 转换
                 mega_tensor_cpu = mega_tensor_gpu.cpu().float().numpy().astype(ml_dtypes.bfloat16)
 
                 for idx_enum, step in enumerate(target_indices):
@@ -179,13 +201,6 @@ class StochasticExtractor(HiddenStateExtractor):
             run_verbalize: bool, run_self_evaluator: bool, extract_stochastic_hs: bool,
             max_queue_size: int = 10
     ):
-        """
-        高度内聚的主流程，和 process_from_file 一样优雅。
-
-        注意：
-        - run_verbalize / run_self_evaluator 参数仅为兼容旧调用保留；
-        - 本文件现在只负责 stochastic sampling，不再生成任何 auxiliary eval 字段。
-        """
         os.makedirs(os.path.dirname(output_h5_path) or ".", exist_ok=True)
         
         # 1. 启动 I/O 进程
@@ -197,7 +212,6 @@ class StochasticExtractor(HiddenStateExtractor):
         writer_process.daemon = True
         writer_process.start()
 
-        # 2. 🎯 严谨继承：实例化 Builder (连 system_prompt 也传进去了)
         print("[*] 正在加载数据池并初始化 Prompt 渲染引擎...")
         prompt_builder = LLMPromptBuilder(
             model_name=self.model_name,
@@ -218,13 +232,11 @@ class StochasticExtractor(HiddenStateExtractor):
                 sample_id = item["sample_id"]
                 print(f"[Main] 多次采样推理中: {sample_id}...")
 
-                # 构建完全相同的 Prompt
                 prompt_str = prompt_builder.build_prompt(
                     target_item=item,
                     few_shot_pool=dataset_items
                 )
                 
-                # 获取 num_samples 次串行生成结果
                 batch_results = self.generate_and_extract_stochastic(
                     prompt_str, layer_config, token_config, max_new_tokens, num_samples, generation_kwargs
                 )
@@ -233,7 +245,6 @@ class StochasticExtractor(HiddenStateExtractor):
                 meta_item["stochastic_samples"] = [s["text"] for s in batch_results]
                 meta_item["stochastic_log_likelihoods"] = [s["seq_logprob"] for s in batch_results]
 
-                # 扔进队列让子进程去慢慢存
                 data_queue.put({
                     "sample_id": sample_id,
                     "batch_results": batch_results,
