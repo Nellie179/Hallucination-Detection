@@ -53,40 +53,146 @@ EVAL_CONFIG = {
     "model_kwargs": {"trust_remote_code": True, "attn_implementation": "sdpa"}
 }
 
+def enforce_safe_resume(base_meta_path, target_jsonl, target_h5, expected_total, rollback_count=2):
+    """
+    Check JSONL and H5 progress. If incomplete, trim the last `rollback_count` samples
+    (to avoid dirty / partially-written entries) and return a temp meta path that contains
+    only the remaining samples so the underlying extractor can resume cleanly.
+
+    Returns:
+        None          — everything is already 100% complete, no work needed
+        base_meta_path — nothing to resume from, run the full dataset
+        temp_path     — path to a temp JSONL with only the unfinished samples
+    """
+    ordered_items = []
+    with open(base_meta_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            if line.strip():
+                ordered_items.append(json.loads(line))
+
+    # 1. Scan JSONL progress
+    valid_json_lines = []
+    json_ids = set()
+    if target_jsonl and os.path.exists(target_jsonl):
+        with open(target_jsonl, 'r', encoding='utf-8') as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    data = json.loads(line)
+                    json_ids.add(str(data["sample_id"]))
+                    valid_json_lines.append(line)
+                except Exception:
+                    logger.warning("JSONL tail is broken; will truncate during rollback.")
+                    break
+
+    # 2. Scan H5 progress (lenient key match)
+    h5_ids = set()
+    if target_h5 and os.path.exists(target_h5):
+        try:
+            with h5py.File(target_h5, 'r') as f_h5:
+                h5_keys = set(f_h5.keys())
+                for item in ordered_items:
+                    sid = str(item["sample_id"])
+                    if sid in h5_keys or any(k.startswith(sid + "_") for k in h5_keys):
+                        h5_ids.add(sid)
+        except Exception as e:
+            logger.warning(f"H5 tail may be corrupt: {e} — falling back to JSONL-driven recovery.")
+
+    # Use the intersection so JSONL and H5 stay aligned
+    if target_jsonl and target_h5:
+        processed_ids = json_ids.intersection(h5_ids)
+    elif target_jsonl:
+        processed_ids = json_ids
+    elif target_h5:
+        processed_ids = h5_ids
+    else:
+        processed_ids = set()
+
+    if not processed_ids:
+        return base_meta_path
+
+    highest_idx = -1
+    for i, item in enumerate(ordered_items):
+        if str(item["sample_id"]) in processed_ids:
+            highest_idx = i
+
+    if len(processed_ids) >= expected_total and highest_idx == expected_total - 1:
+        return None
+
+    # 3. Roll back by `rollback_count` to drop any partially-written tail
+    safe_limit_idx = max(-1, highest_idx - rollback_count)
+    safe_ids = set(str(item["sample_id"]) for item in ordered_items[:safe_limit_idx + 1])
+
+    logger.info(
+        f"Progress interrupted at {highest_idx + 1}/{expected_total}; "
+        f"rolling back {rollback_count} samples to flush any dirty tail."
+    )
+
+    # Truncate JSONL
+    if target_jsonl and os.path.exists(target_jsonl):
+        with open(target_jsonl, 'w', encoding='utf-8') as f:
+            for line in valid_json_lines:
+                try:
+                    if str(json.loads(line)["sample_id"]) in safe_ids:
+                        f.write(line)
+                except Exception:
+                    pass
+
+    # Truncate H5
+    if target_h5 and os.path.exists(target_h5):
+        try:
+            with h5py.File(target_h5, 'a') as f_h5:
+                for key in list(f_h5.keys()):
+                    is_safe = any(key == sid or key.startswith(sid + "_") for sid in safe_ids)
+                    if not is_safe:
+                        del f_h5[key]
+        except Exception as e:
+            logger.warning(f"H5 cleanup warning: {e}. File may be badly damaged.")
+
+    # 4. Write a temp meta file containing only the remaining samples
+    temp_meta_path = base_meta_path + ".resume_temp"
+    with open(temp_meta_path, 'w', encoding='utf-8') as f:
+        for item in ordered_items[safe_limit_idx + 1:]:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+    logger.info(f"Safe-resume prepared: {expected_total - (safe_limit_idx + 1)} samples remaining.")
+    return temp_meta_path
+
+
 def validate_stochastic_cache(jsonl_path: str, active_detectors: list, expected_total: int) -> bool:
-    """鲁棒性特征校验器：深度检查 JSONL 缓存文件的完整性。"""
+    """Check whether the stochastic sample JSONL cache is complete and well-formed."""
     if not os.path.exists(jsonl_path):
         return False
-        
+
     required_keys = ["sample_id"]
     if any(getattr(d, "requires_stochastic", False) for d in active_detectors):
         required_keys.append("stochastic_samples")
-        
+
     try:
         valid_count = 0
         with open(jsonl_path, 'r', encoding='utf-8') as f:
             for line in f:
-                if not line.strip(): continue
+                if not line.strip():
+                    continue
                 data = json.loads(line)
                 if not all(k in data for k in required_keys):
-                    print(f"[-] 缓存失效: 样本 {data.get('sample_id')} 缺失关键字段，当前要求包含 {required_keys}")
                     return False
                 if "stochastic_samples" in required_keys and not data.get("stochastic_samples"):
-                    print(f"[-] 缓存失效: 样本 {data.get('sample_id')} 的 stochastic_samples 为空")
                     return False
                 valid_count += 1
-                
+
         if valid_count < expected_total:
-            print(f"[-] 缓存失效: 样本数量不匹配 (当前缓存 {valid_count} 个，预期需要 {expected_total} 个)")
             return False
-            
+
         return True
     except Exception as e:
-        print(f"[-] 缓存文件损坏或解析异常: {e}")
+        logger.warning(f"Stochastic cache parse error: {e}")
         return False
 
+
 def validate_aux_cache(jsonl_path: str, active_detectors: list, expected_total: int) -> bool:
-    """校验 auxiliary eval 缓存文件完整性。"""
+    """Check whether the auxiliary eval JSONL cache is complete and well-formed."""
     if not os.path.exists(jsonl_path):
         return False
 
@@ -104,17 +210,15 @@ def validate_aux_cache(jsonl_path: str, active_detectors: list, expected_total: 
                     continue
                 data = json.loads(line)
                 if not all(k in data for k in required_keys):
-                    print(f"[-] Auxiliary 缓存失效: 样本 {data.get('sample_id')} 缺失关键字段，当前要求包含 {required_keys}")
                     return False
                 valid_count += 1
 
         if valid_count < expected_total:
-            print(f"[-] Auxiliary 缓存失效: 样本数量不匹配 (当前缓存 {valid_count} 个，预期需要 {expected_total} 个)")
             return False
 
         return True
     except Exception as e:
-        print(f"[-] Auxiliary 缓存文件损坏或解析异常: {e}")
+        logger.warning(f"Auxiliary cache parse error: {e}")
         return False
 
 def get_detector(name: str):
