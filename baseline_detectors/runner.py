@@ -80,6 +80,105 @@ EVAL_CONFIG = {
     "model_kwargs": {"trust_remote_code": True}
 }
 
+
+
+# =======================================================================================
+# 🚀 军工级核心：退二保底与断点续传容灾器 (Safe Resume Manager)
+# =======================================================================================
+def enforce_safe_resume(base_meta_path, target_jsonl, target_h5, expected_total, rollback_count=2):
+    """
+    检查 JSONL 和 H5 进度。如果不完整，切除末尾 rollback_count 个样本防脏数据，
+    返回一个只包含剩余样本的 temp_meta_path 供底层无缝追加。
+    """
+    ordered_items = []
+    with open(base_meta_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            if line.strip(): ordered_items.append(json.loads(line))
+
+    # 1. 扫描 JSONL 进度与验证完好性
+    valid_json_lines = []
+    json_ids = set()
+    if target_jsonl and os.path.exists(target_jsonl):
+        with open(target_jsonl, 'r', encoding='utf-8') as f:
+            for line in f:
+                if not line.strip(): continue
+                try:
+                    data = json.loads(line)
+                    json_ids.add(str(data["sample_id"]))
+                    valid_json_lines.append(line)
+                except:
+                    print("    [!] 发现 JSONL 尾部结构断裂，将在回滚中物理截断。")
+                    break
+
+    # 2. 扫描 H5 进度 (宽容匹配)
+    h5_ids = set()
+    if target_h5 and os.path.exists(target_h5):
+        try:
+            with h5py.File(target_h5, 'r') as f_h5:
+                h5_keys = set(f_h5.keys())
+                for item in ordered_items:
+                    sid = str(item["sample_id"])
+                    if sid in h5_keys or any(k.startswith(sid + "_") for k in h5_keys):
+                        h5_ids.add(sid)
+        except Exception as e:
+            print(f"    [!] H5 文件尾部块可能损坏: {e}。将由 JSONL 进度主导修复。")
+
+    # 取进度交集（谁慢听谁的，保证对齐）
+    if target_jsonl and target_h5: processed_ids = json_ids.intersection(h5_ids)
+    elif target_jsonl: processed_ids = json_ids
+    elif target_h5: processed_ids = h5_ids
+    else: processed_ids = set()
+
+    if len(processed_ids) == 0: return base_meta_path
+
+    # 找到连续最高的安全位
+    highest_idx = -1
+    for i, item in enumerate(ordered_items):
+        if str(item["sample_id"]) in processed_ids:
+            highest_idx = i
+
+    if len(processed_ids) >= expected_total and highest_idx == expected_total - 1:
+        return None # 100% 完成，不需要跑了
+
+    # 3. 🚀 退二保底 (物理切除脏尾巴)
+    safe_limit_idx = max(-1, highest_idx - rollback_count)
+    safe_ids = set([str(item["sample_id"]) for item in ordered_items[:safe_limit_idx + 1]])
+
+    print(f"    🛠️ 发现进度中断 (当前有效至: {highest_idx + 1}/{expected_total})。执行退二保底清理 (-{rollback_count})...")
+
+    # 切除 JSONL 脏尾
+    if target_jsonl and os.path.exists(target_jsonl):
+        with open(target_jsonl, 'w', encoding='utf-8') as f:
+            for line in valid_json_lines:
+                try:
+                    if str(json.loads(line)["sample_id"]) in safe_ids:
+                        f.write(line)
+                except: pass
+
+    # 切除 H5 脏尾
+    if target_h5 and os.path.exists(target_h5):
+        try:
+            with h5py.File(target_h5, 'a') as f_h5:
+                for key in list(f_h5.keys()):
+                    is_safe = False
+                    for sid in safe_ids:
+                        if key == sid or key.startswith(sid + "_"):
+                            is_safe = True
+                            break
+                    if not is_safe:
+                        del f_h5[key] # 物理铲除坏块
+        except Exception as e:
+            print(f"    [!] H5 清理警告: {e}。若持续报错，文件可能已严重损坏。")
+
+    # 4. 瞒天过海：生成续传专用的临时残卷
+    temp_meta_path = base_meta_path + ".resume_temp"
+    with open(temp_meta_path, 'w', encoding='utf-8') as f:
+        for item in ordered_items[safe_limit_idx + 1:]:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+    print(f"    [+] 切除完毕！准备从剩余 {expected_total - (safe_limit_idx + 1)} 条开始极速追加。")
+    return temp_meta_path
+
 def validate_stochastic_cache(jsonl_path: str, active_detectors: list, expected_total: int) -> bool:
     """鲁棒性特征校验器：深度检查 JSONL 缓存文件的完整性。"""
     if not os.path.exists(jsonl_path):
