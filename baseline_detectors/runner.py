@@ -8,8 +8,9 @@ import logging
 import time
 from tqdm import tqdm
 
+_log_level = os.getenv("RUNNER_LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, _log_level, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
     handlers=[
@@ -18,6 +19,7 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+logger.debug(f"Logger initialized at level {_log_level}")
 
 # ==========================================
 # 🎯 环境注入：挂载数据模块 (完美修复路径迷失)
@@ -162,12 +164,15 @@ def enforce_safe_resume(base_meta_path, target_jsonl, target_h5, expected_total,
 
 def validate_stochastic_cache(jsonl_path: str, active_detectors: list, expected_total: int) -> bool:
     """Check whether the stochastic sample JSONL cache is complete and well-formed."""
+    logger.debug(f"validate_stochastic_cache path={jsonl_path} expected_total={expected_total}")
     if not os.path.exists(jsonl_path):
+        logger.debug("  cache file does not exist")
         return False
 
     required_keys = ["sample_id"]
     if any(getattr(d, "requires_stochastic", False) for d in active_detectors):
         required_keys.append("stochastic_samples")
+    logger.debug(f"  required_keys={required_keys}")
 
     try:
         valid_count = 0
@@ -177,11 +182,14 @@ def validate_stochastic_cache(jsonl_path: str, active_detectors: list, expected_
                     continue
                 data = json.loads(line)
                 if not all(k in data for k in required_keys):
+                    logger.debug(f"  sample {data.get('sample_id')} missing required keys: {required_keys}")
                     return False
                 if "stochastic_samples" in required_keys and not data.get("stochastic_samples"):
+                    logger.debug(f"  sample {data.get('sample_id')} has empty stochastic_samples")
                     return False
                 valid_count += 1
 
+        logger.debug(f"  valid_count={valid_count} / expected_total={expected_total}")
         if valid_count < expected_total:
             return False
 
@@ -193,7 +201,9 @@ def validate_stochastic_cache(jsonl_path: str, active_detectors: list, expected_
 
 def validate_aux_cache(jsonl_path: str, active_detectors: list, expected_total: int) -> bool:
     """Check whether the auxiliary eval JSONL cache is complete and well-formed."""
+    logger.debug(f"validate_aux_cache path={jsonl_path} expected_total={expected_total}")
     if not os.path.exists(jsonl_path):
+        logger.debug("  aux cache file does not exist")
         return False
 
     required_keys = ["sample_id"]
@@ -201,6 +211,7 @@ def validate_aux_cache(jsonl_path: str, active_detectors: list, expected_total: 
         required_keys.append("verbalize_response")
     if any(d.name == "self_evaluator" for d in active_detectors):
         required_keys.append("self_evaluator_raw")
+    logger.debug(f"  required_keys={required_keys}")
 
     try:
         valid_count = 0
@@ -210,9 +221,11 @@ def validate_aux_cache(jsonl_path: str, active_detectors: list, expected_total: 
                     continue
                 data = json.loads(line)
                 if not all(k in data for k in required_keys):
+                    logger.debug(f"  sample {data.get('sample_id')} missing required keys: {required_keys}")
                     return False
                 valid_count += 1
 
+        logger.debug(f"  valid_count={valid_count} / expected_total={expected_total}")
         if valid_count < expected_total:
             return False
 
@@ -241,36 +254,64 @@ def get_detector(name: str):
         "sar": "sar.SARDetector",
         "haloscope": "haloscope.HaloScopeDetector"
     }
+    logger.debug(f"get_detector name={name}")
     if name not in detectors_map: raise ValueError(f"❌ 未知探测器: {name}")
     module_path, class_name = detectors_map[name].split('.')
+    logger.debug(f"  importing detectors.{module_path}.{class_name}")
     module = __import__(f"detectors.{module_path}", fromlist=[class_name])
-    return getattr(module, class_name)(name=name)
+    instance = getattr(module, class_name)(name=name)
+    logger.debug(
+        f"  built {class_name}: requires_stochastic={getattr(instance, 'requires_stochastic', False)}, "
+        f"requires_qa_features={getattr(instance, 'requires_qa_features', False)}, "
+        f"requires_stochastic_hidden_states={getattr(instance, 'requires_stochastic_hidden_states', False)}"
+    )
+    return instance
 
 def build_accessors(jsonl_path, base_h5, st_dict, st_h5, recovery_dict, aux_dict=None):
+    logger.debug(f"build_accessors jsonl_path={jsonl_path}")
     accessors = []
-    if not os.path.exists(jsonl_path): return accessors
-    
+    if not os.path.exists(jsonl_path):
+        logger.debug(f"  accessor source file missing: {jsonl_path}")
+        return accessors
+
+    aux_hits = 0
+    h5_hits = 0
+    st_hits = 0
+    rec_hits = 0
     with open(jsonl_path, 'r', encoding='utf-8') as f:
         for line in f:
             meta = json.loads(line)
             sid = str(meta["sample_id"])
-            
-            # 🛠️ [修改位置]: verbalize / self_evaluator 改为从独立 aux_dict 挂载到 metadata
+
+            # verbalize / self_evaluator come from a separate aux_dict merged into metadata
             if aux_dict and sid in aux_dict:
+                aux_hits += 1
                 if aux_dict[sid].get("verbalize_response") is not None:
                     meta["verbalize_response"] = aux_dict[sid]["verbalize_response"]
                 if aux_dict[sid].get("self_evaluator_raw") is not None:
                     meta["self_evaluator_raw"] = aux_dict[sid]["self_evaluator_raw"]
                     meta["self_evaluator_response"] = aux_dict[sid]["self_evaluator_raw"]
-            
+
+            base_h5_group = base_h5.get(sid) if base_h5 else None
+            st_h5_group = st_h5.get(sid) if st_h5 else None
+            if base_h5_group is not None: h5_hits += 1
+            if st_h5_group is not None: st_hits += 1
+
             acc = SampleAccessor(
-                sample_id=sid, metadata=meta, 
-                h5_group=base_h5.get(sid) if base_h5 else None, 
+                sample_id=sid, metadata=meta,
+                h5_group=base_h5_group,
                 stochastic_samples_dict=st_dict,
-                stochastic_h5_group=st_h5.get(sid) if st_h5 else None
+                stochastic_h5_group=st_h5_group,
             )
             acc.recovered_logprobs = recovery_dict.get(sid)
+            if acc.recovered_logprobs is not None:
+                rec_hits += 1
             accessors.append(acc)
+
+    logger.debug(
+        f"  built {len(accessors)} accessors | "
+        f"base_h5_hits={h5_hits}, stochastic_h5_hits={st_hits}, aux_hits={aux_hits}, recovery_hits={rec_hits}"
+    )
     return accessors
 
 def run_benchmark(target_models: list, datasets: list, baselines: list):
@@ -297,6 +338,9 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
             base_meta_path = os.path.join(exp_dir, "03_final_scored_metadata.jsonl")
             train_meta_path = os.path.join(exp_dir, "03_train.jsonl")
             test_meta_path = os.path.join(exp_dir, "03_test.jsonl")
+            logger.debug(f"  base_meta_path exists={os.path.exists(base_meta_path)}: {base_meta_path}")
+            logger.debug(f"  train_meta_path exists={os.path.exists(train_meta_path)}: {train_meta_path}")
+            logger.debug(f"  test_meta_path exists={os.path.exists(test_meta_path)}: {test_meta_path}")
 
             if not os.path.exists(train_meta_path) or not os.path.exists(test_meta_path):
                 logger.info("Train/test split files missing — running split now...")
@@ -309,6 +353,8 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
             base_h5_path = os.path.join(exp_dir, "02_hidden_states.h5")
             recovery_h5_path = os.path.join(exp_dir, "05_qa_features_base_logit_recovery.h5")
             final_report_path = os.path.join(exp_dir, "06_evaluation_results.json")
+            for p in [st_jsonl_path, st_h5_path, aux_jsonl_path, base_h5_path, recovery_h5_path]:
+                logger.debug(f"  cache path exists={os.path.exists(p)}: {p}")
 
             with open(base_meta_path, 'r', encoding='utf-8') as f_meta:
                 expected_total = sum(1 for _ in f_meta)
@@ -382,6 +428,7 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
             for det in active_detectors:
                 if getattr(det, "requires_qa_features", False) and det.name != "saplma":
                     qa_path = os.path.join(exp_dir, f"05_qa_features_{det.name}.h5")
+                    logger.debug(f"  checking QA features for '{det.name}' at {qa_path}")
 
                     need_extract = False
                     if not os.path.exists(qa_path):
@@ -391,11 +438,13 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
                         try:
                             with h5py.File(qa_path, 'r') as f_check:
                                 all_keys = list(f_check.keys())
+                                logger.debug(f"    existing QA groups: {len(all_keys)} (expected {expected_total})")
                                 if not all_keys or len(all_keys) < expected_total:
                                     logger.warning(f"QA features for '{det.name}' incomplete ({len(all_keys)}/{expected_total}) — re-extracting...")
                                     need_extract = True
                                 else:
                                     sample_grp = f_check[all_keys[0]]
+                                    logger.debug(f"    first group fields: {list(sample_grp.keys())}")
                                     if det.name == "self_evaluator" and "logprobs" not in sample_grp:
                                         logger.warning(f"'{det.name}' missing logprobs field — re-extracting...")
                                         need_extract = True
@@ -415,6 +464,8 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
                         process_dataset(input_jsonl=base_meta_path, output_h5=qa_path, model_name=target_model, method=det.name, model_kwargs=EVAL_CONFIG["model_kwargs"])
                         torch.cuda.empty_cache()
                         logger.info(f"  '{det.name}' QA extraction done in {time.time()-t0:.1f}s")
+                    else:
+                        logger.debug(f"  '{det.name}' QA features OK, skipping extraction")
 
             # Phase 2 — load features
             logger.info("[Phase 2] Loading cached features into memory...")
@@ -474,17 +525,29 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
             raw_scores = {acc.sample_id: {} for acc in test_accessors}
             for detector in active_detectors:
                 logger.info(f"  Running detector: {detector.name}")
+                logger.debug(
+                    f"    detector flags: requires_stochastic={getattr(detector, 'requires_stochastic', False)}, "
+                    f"requires_qa_features={getattr(detector, 'requires_qa_features', False)}, "
+                    f"requires_stochastic_hidden_states={getattr(detector, 'requires_stochastic_hidden_states', False)}"
+                )
                 t0 = time.time()
                 if getattr(detector, "requires_qa_features", False):
                     target_h5 = qa_h5_handles.get(detector.name)
+                    logger.debug(f"    attaching QA h5 handle for '{detector.name}': present={target_h5 is not None}")
                     for acc in train_accessors + test_accessors:
                         acc.qa_h5_file = target_h5
                         acc.method_type = detector.name
 
                 detector.fit(train_accessors)
                 logger.info(f"    fit() complete — scoring {len(test_accessors)} test samples...")
+                nan_count = 0
                 for acc in tqdm(test_accessors, desc=f"Scoring [{detector.name}]", leave=False):
-                    raw_scores[acc.sample_id][detector.name] = detector.predict_score(acc)
+                    score = detector.predict_score(acc)
+                    raw_scores[acc.sample_id][detector.name] = score
+                    if score is None or (isinstance(score, float) and math.isnan(score)):
+                        nan_count += 1
+                if nan_count:
+                    logger.debug(f"    {detector.name} produced {nan_count} nan/None scores out of {len(test_accessors)}")
                 logger.info(f"    {detector.name} done in {time.time()-t0:.1f}s")
 
             # Phase 4 — metrics
