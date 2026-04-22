@@ -182,7 +182,8 @@ def get_detector(name: str):
         "sep": "sep.SEPDetector",
         "mind": "mind.MINDDetector",
         "sar": "sar.SARDetector",
-        "haloscope": "haloscope.HaloScopeDetector"
+        "haloscope": "haloscope.HaloScopeDetector",
+        "tsv": "tsv.TSVDetector"
     }
     if name not in detectors_map: raise ValueError(f"❌ 未知探测器: {name}")
     module_path, class_name = detectors_map[name].split('.')
@@ -317,7 +318,7 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
 
             # 【1.6】其他 SDPA 探测器
             for det in active_detectors:
-                if getattr(det, "requires_qa_features", False) and det.name not in ["saplma", "icr_probe", "haloscope", "mind"]:
+                if getattr(det, "requires_qa_features", False) and det.name not in ["saplma", "icr_probe", "haloscope", "mind", "tsv"]:
                     qa_path = os.path.join(exp_dir, f"05_qa_features_{det.name}.h5")
                     print(f"\n[*] 扫描 {det.name} 专属特征提取进度...")
                     if enforce_safe_resume(base_meta_path, None, qa_path, expected_total):
@@ -325,10 +326,44 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
                         process_dataset(input_jsonl=base_meta_path, output_h5=qa_path, model_name=target_model, method=det.name, model_kwargs=EVAL_CONFIG["model_kwargs"], model=m, tokenizer=t, pooling=EVAL_CONFIG.get("pooling_method", "mean"))
                         torch.cuda.empty_cache()
 
+            # ==========================================================
+            # 🚀 【1.7】TSV 任务引导向量全自动训练与提取 (白嫖当前 SDPA 模型)
+            # ==========================================================
+            if "tsv" in baselines:
+                tsv_path = os.path.join(exp_dir, "05_qa_features_tsv.jsonl")
+                # 检查是否已有缓存，避免重跑
+                if not os.path.exists(tsv_path):
+                    print(f"\n[*] 启动 TSV 专属特征提取引擎 (注入当前 SDPA 全局模型)...")
+                    
+                    # 🚀 关键：直接调用你架构里的 get_sdpa_model()，它会自动返回已加载的模型
+                    m, t = get_sdpa_model() 
+                    
+                    from baseline_detectors.data_utils.extract_tsv_features import TSVFeatureExtractor
+                    tsv_extractor = TSVFeatureExtractor(
+                        model_name=target_model, 
+                        model=m, 
+                        tokenizer=t
+                    )
+                    
+                    # 🚀 执行训练与全量打分 (input 锁定为你的 base_meta_path，即 03 文件)
+                    tsv_extractor.process_and_extract(
+                        input_jsonl_path=base_meta_path,
+                        output_jsonl_path=tsv_path,
+                        str_layer=9,
+                        num_train_samples=500
+                    )
+                    
+                    # 释放提取器引用，但模型依然留在显存供后续使用（直到下面清空）
+                    del tsv_extractor
+                    torch.cuda.empty_cache()
+                else:
+                    print(f"[+] 检测到 TSV 专属特征已存在，跳过提取过程。")
+
             if sdpa_model is not None:
                 del sdpa_model, sdpa_tokenizer
                 gc.collect()
                 torch.cuda.empty_cache()
+                torch.cuda.ipc_collect() # 👈 清理跨进程显存残留
 
             # 【相位 2】Eager 模式 (ICR Probe)
             for det in active_detectors:
@@ -424,8 +459,8 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
 if __name__ == "__main__":
     set_global_seed(42)
     run_benchmark(
-        target_models=["meta-llama/Llama-3.1-8B-Instruct"],
-        datasets=["svamp"],
+        target_models=["meta-llama/Llama-3.2-3B-Instruct"],
+        datasets=["belebele"],
         baselines=[
             "selfcheck_bertscore",
             "selfcheck_nli",
@@ -443,6 +478,7 @@ if __name__ == "__main__":
             "icr_probe",
             "mind",
             "sar",
-            "haloscope"
+            "haloscope",
+            "tsv"
         ] 
     )
