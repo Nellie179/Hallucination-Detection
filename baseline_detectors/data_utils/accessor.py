@@ -2,7 +2,7 @@
 import h5py
 import numpy as np
 from typing import Dict, Any, List, Optional
-
+import ml_dtypes  # 🚀 必须导入，为了解析 bfloat16
 class SampleAccessor:
     """
     统一的数据访问器（Facade）。
@@ -88,7 +88,7 @@ class SampleAccessor:
             target_layer_key = layer_keys[layer_idx]
             
             data = step_grp[target_layer_key][:]
-            if data.dtype.kind == 'V': data = data.view(np.float16)
+            if data.dtype.kind == 'V': data = data.view(ml_dtypes.bfloat16).astype(np.float32)
             layer_tensors.append(data)
             
         return np.stack(layer_tensors, axis=0) # [num_tokens, hidden_dim]
@@ -120,7 +120,7 @@ class SampleAccessor:
             data = self.h5_group["logprobs"][:]
             # 处理 float16 可能存在的 void type 存储问题
             if data.dtype.kind == 'V':
-                data = data.view(np.float16)
+                data = data.view(ml_dtypes.bfloat16).astype(np.float32)
             return data.tolist()
 
         # --- 兜底：返回空列表 ---
@@ -144,7 +144,7 @@ class SampleAccessor:
         for tk in token_keys:
             if target_layer_key in tokens_grp[tk]:
                 data = tokens_grp[tk][target_layer_key][:]
-                if data.dtype.kind == 'V': data = data.view(np.float16)
+                if data.dtype.kind == 'V': data = data.view(ml_dtypes.bfloat16).astype(np.float32)
                 tensors.append(data)
 
         tensors_array = np.array(tensors)
@@ -169,7 +169,7 @@ class SampleAccessor:
         layer_keys = sorted([k for k in layer_grp.keys() if k.startswith("layer_")], key=lambda x: int(x.split('_')[1]))
         
         data = layer_grp[layer_keys[layer_idx]][:]
-        if data.dtype.kind == 'V': data = data.view(np.float16)
+        if data.dtype.kind == 'V': data = data.view(ml_dtypes.bfloat16).astype(np.float32)
         return data
 
     def get_contrast_hidden_states(self, layer_idx: int = -1) -> tuple:

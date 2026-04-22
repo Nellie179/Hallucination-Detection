@@ -9,9 +9,19 @@ import ml_dtypes
 import multiprocessing as mp
 from typing import Dict, Any, List
 
+# 🚀 修改点 1：引入拦截器组件
+from transformers import LogitsProcessor, LogitsProcessorList
+
 # 🎯 纯正的邻居法则引入
 from hidden_state import HiddenStateExtractor
 from prompt_builder import LLMPromptBuilder
+
+# 🚀 修改点 2：新增数值安全阀，物理拦截 NaN 和 Inf，防止 multinomial 崩溃
+class MultinomialSafetyProcessor(LogitsProcessor):
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        if torch.isnan(scores).any() or torch.isinf(scores).any():
+            scores = torch.nan_to_num(scores, nan=-100.0, posinf=100.0, neginf=-100.0)
+        return scores
 
 # ==========================================
 # 异步 I/O 专职子进程
@@ -102,6 +112,9 @@ class StochasticExtractor(HiddenStateExtractor):
 
         batch_results = []
 
+        # 🚀 修改点 3：实例化安全处理器
+        safety_processors = LogitsProcessorList([MultinomialSafetyProcessor()])
+
         # =========================================================================
         # 🎯 严谨对齐原论文：Multinomial Beam Sampling (支持 num_beams > 1)
         # =========================================================================
@@ -117,6 +130,8 @@ class StochasticExtractor(HiddenStateExtractor):
                     "output_hidden_states": True,
                     "output_scores": True,
                     "pad_token_id": self.tokenizer.pad_token_id,
+                    "renormalize_logits": True,               # 确保概率归一化
+                    "logits_processor": safety_processors     # 🚀 必须挂载安全阀拦截 NaN
                 }
                 outputs = self.model.generate(**final_gen_kwargs)
 
@@ -134,9 +149,17 @@ class StochasticExtractor(HiddenStateExtractor):
 
             # 因为每次只生成 1 条，所以索引永远取 0
             new_tokens = outputs.sequences[0, prompt_len:]
-            valid_mask = (new_tokens != self.tokenizer.pad_token_id) & (new_tokens != self.tokenizer.eos_token_id)
-            valid_tokens = new_tokens[valid_mask]
-            total_generated = len(valid_tokens)
+            # valid_mask = (new_tokens != self.tokenizer.pad_token_id) & (new_tokens != self.tokenizer.eos_token_id)
+            # valid_tokens = new_tokens[valid_mask]
+            # total_generated = len(valid_tokens)
+            # full_output_text = self.tokenizer.decode(valid_tokens, skip_special_tokens=True)
+
+            # 🚀 修复 1: 寻找第一个 EOS 或 PAD，在那个位置一刀切断，绝不使用全局过滤！
+            stop_masks = (new_tokens == self.tokenizer.eos_token_id) | (new_tokens == self.tokenizer.pad_token_id)
+            stop_indices = stop_masks.nonzero(as_tuple=True)[0]
+            total_generated = stop_indices[0].item() if len(stop_indices) > 0 else len(new_tokens)
+            
+            valid_tokens = new_tokens[:total_generated]
             full_output_text = self.tokenizer.decode(valid_tokens, skip_special_tokens=True)
 
             token_logprobs = []
@@ -203,6 +226,21 @@ class StochasticExtractor(HiddenStateExtractor):
     ):
         os.makedirs(os.path.dirname(output_h5_path) or ".", exist_ok=True)
         
+        # =========================================================================
+        # 🚀 [终极容灾]: 智能嗅探已完成的样本，为原卷跑酷做准备
+        # =========================================================================
+        existing_ids = set()
+        if os.path.exists(output_jsonl_path):
+            with open(output_jsonl_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    if line.strip():
+                        try:
+                            existing_ids.add(str(json.loads(line)["sample_id"]))
+                        except: pass
+        
+        if existing_ids:
+            print(f"[*] 底层自愈引擎：已嗅探到 {len(existing_ids)} 条完好历史记录，将光速跳过！")
+
         # 1. 启动 I/O 进程
         data_queue = mp.Queue(maxsize=max_queue_size)
         writer_process = mp.Process(
@@ -227,36 +265,54 @@ class StochasticExtractor(HiddenStateExtractor):
                     dataset_items.append(json.loads(line))
 
         processed_count = 0
+        skipped_count = 0
         try:
             for item in dataset_items:
-                sample_id = item["sample_id"]
+                sample_id = str(item["sample_id"])
+                
+                # =========================================================================
+                # 🚀 [底层跑酷]: 如果样本在 JSONL 里存在，连 Prompt 都不拼，直接光速跳过
+                # =========================================================================
+                if sample_id in existing_ids:
+                    skipped_count += 1
+                    continue
+
                 print(f"[Main] 多次采样推理中: {sample_id}...")
 
-                prompt_str = prompt_builder.build_prompt(
-                    target_item=item,
-                    few_shot_pool=dataset_items
-                )
-                
-                batch_results = self.generate_and_extract_stochastic(
-                    prompt_str, layer_config, token_config, max_new_tokens, num_samples, generation_kwargs
-                )
+                # 🚀 修改点 4：增加 try...except 容灾，确保单个样本底层报错时不连累整个进程
+                try:
+                    prompt_str = prompt_builder.build_prompt(
+                        target_item=item,
+                        few_shot_pool=dataset_items
+                    )
+                    
+                    batch_results = self.generate_and_extract_stochastic(
+                        prompt_str, layer_config, token_config, max_new_tokens, num_samples, generation_kwargs
+                    )
 
-                meta_item = item.copy()
-                meta_item["stochastic_samples"] = [s["text"] for s in batch_results]
-                meta_item["stochastic_log_likelihoods"] = [s["seq_logprob"] for s in batch_results]
+                    meta_item = item.copy()
+                    meta_item["stochastic_samples"] = [s["text"] for s in batch_results]
+                    meta_item["stochastic_log_likelihoods"] = [s["seq_logprob"] for s in batch_results]
 
-                data_queue.put({
-                    "sample_id": sample_id,
-                    "batch_results": batch_results,
-                    "meta_item": meta_item
-                }, block=True)
-                processed_count += 1
+                    data_queue.put({
+                        "sample_id": sample_id,
+                        "batch_results": batch_results,
+                        "meta_item": meta_item
+                    }, block=True)
+                    processed_count += 1
+                except Exception as e:
+                    print(f"\n[!] 🚨 样本 {sample_id} 采样发生底层异常，已打入死信队列并跳过！错误: {e}")
+                    error_log_path = output_jsonl_path + ".failed_ids.txt"
+                    with open(error_log_path, 'a', encoding='utf-8') as f_err:
+                        f_err.write(f"{sample_id}\t{e}\n")
+                    torch.cuda.empty_cache()
+                    continue
 
         except KeyboardInterrupt:
-            print("\n[!] 🛑 接收到打断信号，准备安全退出...")
+            print("\n[!] 🛑 接收到物理打断信号，准备安全退出...")
         finally:
             data_queue.put(None)
             writer_process.join(timeout=10)
             if writer_process.is_alive():
                 writer_process.terminate()
-            print(f"[+] 采样提取流水线安全退出！处理了 {processed_count} 条。")
+            print(f"[+] 采样提取流水线安全退出！本次跳过了 {skipped_count} 条，实际处理了 {processed_count} 条。")

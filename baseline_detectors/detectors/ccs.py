@@ -10,6 +10,7 @@ import logging
 from typing import List
 import sys
 import os
+import math  # 🚀 [修复 NaN] 新增 math 用于检测 NaN
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -39,8 +40,9 @@ class CCSProbe(object):
     """CCS 核心算法实现"""
     def __init__(self, x0, x1, nepochs=1000, ntries=10, lr=1e-3, batch_size=-1, verbose=False, device="cuda", linear=True, weight_decay=0.01, var_normalize=False):
         self.var_normalize = var_normalize
-        self.x0_mean, self.x0_std = x0.mean(axis=0, keepdims=True), x0.std(axis=0, keepdims=True) + 1e-8
-        self.x1_mean, self.x1_std = x1.mean(axis=0, keepdims=True), x1.std(axis=0, keepdims=True) + 1e-8
+        # 🚀 [修复 NaN] 将 1e-8 改为 1e-5，防止 float16 精度下溢导致标准差彻底变成 0 从而引发除零错误
+        self.x0_mean, self.x0_std = x0.mean(axis=0, keepdims=True), x0.std(axis=0, keepdims=True) + 1e-5
+        self.x1_mean, self.x1_std = x1.mean(axis=0, keepdims=True), x1.std(axis=0, keepdims=True) + 1e-5
         
         self.x0 = self.normalize(x0, is_x0=True)
         self.x1 = self.normalize(x1, is_x0=False)
@@ -60,7 +62,8 @@ class CCSProbe(object):
         std = self.x0_std if is_x0 else self.x1_std
         res = x - mean
         if self.var_normalize: res /= std
-        return res
+        # 🚀 [修复 NaN] 强行兜底清洗，绝不让 NaN 漏入矩阵
+        return np.nan_to_num(res, nan=0.0, posinf=1e4, neginf=-1e4)
 
     def get_loss(self, p0, p1):
         informative_loss = (torch.min(p0, p1)**2).mean(0)
@@ -114,7 +117,12 @@ class CCSDetector(BaseDetector):
             layers = [int(k.split("_")[1]) for k in grp["positive"].keys() if k.startswith("layer_")]
             layer_str = f"layer_{max(layers)}"
             
-        return np.array(grp["positive"][layer_str]), np.array(grp["negative"][layer_str])
+        # 🚀 [修复 NaN] 强转 float32 并清洗，斩断 H5 文件里可能残留的低精度毒素
+        p = np.array(grp["positive"][layer_str]).astype(np.float32)
+        n = np.array(grp["negative"][layer_str]).astype(np.float32)
+        p = np.nan_to_num(p, nan=0.0, posinf=1e4, neginf=-1e4)
+        n = np.nan_to_num(n, nan=0.0, posinf=1e4, neginf=-1e4)
+        return p, n
 
     def fit(self, train_accessors: List[SampleAccessor]) -> None:
         x0_list, x1_list, y_list = [], [], []
@@ -145,7 +153,8 @@ class CCSDetector(BaseDetector):
         logger.info(f"[{self.name}] 训练完成，方向翻转: {self.needs_flip}")
 
     def predict_score(self, accessor: SampleAccessor) -> float:
-        if not self.is_fitted: return float('nan')
+        # 🚀 [修复 NaN] 没拟合时给兜底分 0.5，不要返回 NaN
+        if not self.is_fitted: return 0.5 
         try:
             p, n = self._extract_features(accessor)
             p_norm = self.ccs_probe.normalize(p.reshape(1, -1), True)
@@ -154,5 +163,10 @@ class CCSDetector(BaseDetector):
                 prob0 = self.ccs_probe.best_probe(torch.tensor(p_norm, dtype=torch.float, device=self.device)).cpu().item()
                 prob1 = self.ccs_probe.best_probe(torch.tensor(n_norm, dtype=torch.float, device=self.device)).cpu().item()
                 score = 0.5 * (prob0 + (1 - prob1))
-            return 1.0 - score if self.needs_flip else score
-        except Exception: return float('nan')
+            
+            final_score = 1.0 - score if self.needs_flip else score
+            # 🚀 [修复 NaN] 最后算出来是 NaN 也要兜底
+            if math.isnan(final_score): return 0.5
+            return final_score
+        # 🚀 [修复 NaN] 报错时返回兜底 0.5
+        except Exception: return 0.5

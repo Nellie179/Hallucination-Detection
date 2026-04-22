@@ -43,39 +43,50 @@ class VerbalizeDetector(BaseDetector):
 
     def _extract_confidence(self, text: str) -> float:
         """
-        强化版正则提取逻辑：
-        寻找类似 0.8, .8, 80%, 1, 0 或 'Confidence: 0.9' 中的数字。
-        解决了原版无法识别单独的 \"1\" 或 \"0\" 的致命 Bug。
+        🚀 终极修复版正则：精准定位，防误杀，强制截断
         """
-        if text is None: return 0.0
+        if not text: return 0.5
+        text = str(text).lower()
         
-        # 匹配规则优先级：百分比 > 浮点数 > 单独的 1 或 0 (防止边界值漏抓)
-        matches = re.findall(r"\d+%\.?\d*|0?\.\d+|1\.0|1|0", str(text))
-        if not matches:
-            return 0.5 # 源码兜底逻辑
+        # 1. 优先尝试提取具有明确指示符的分数 (防误抓文本里的数字)
+        # 匹配 "confidence: 0.8", "score is 90%" 等
+        match = re.search(r'(?:confidence|score|certainty).*?([0-9]*\.?[0-9]+%?)', text)
         
-        last_match = matches[-1] # 通常取最后一个出现的数字
+        if match:
+            num_str = match.group(1)
+        else:
+            # 2. 如果没有指示符，只抓取孤立的数字 (排除年份、普通数量词)
+            # 使用 \b 确保数字是独立的
+            matches = re.findall(r"\b(\d+%\.?\d*|0?\.\d+|1\.0|1|0)\b", text)
+            if not matches: return 0.5
+            # 如果有多个，假设模型倾向于把最终得分放在末尾
+            num_str = matches[-1] 
+
+        # 3. 安全转换与截断
         try:
-            if "%" in last_match:
-                return float(last_match.replace("%", "")) / 100.0
-            return float(last_match)
-        except ValueError:
+            if "%" in num_str:
+                val = float(num_str.replace("%", "")) / 100.0
+            else:
+                val = float(num_str)
+                # 兼容模型直接输出 1-10 甚至 1-100 的评分制
+                if val > 1.0 and val <= 10.0:
+                    val = val / 10.0
+                elif val > 10.0 and val <= 100.0:
+                    val = val / 100.0
+                    
+            # 🚨 终极保护：确保概率绝对在 0 到 1 之间
+            return min(max(val, 0.0), 1.0)
+        except Exception:
             return 0.5
 
     def predict_score(self, accessor) -> float:
-        """
-        从 metadata 中读取预先生成的 verbalize_response 并解析
-        """
-        # 1. 尝试从 metadata 中获取模型当时的“自评回复”
         raw_response = accessor.metadata.get("verbalize_response", None)
         
-        # 2. 如果不存在，说明 runner 生成阶段漏掉了这个字段
-        if raw_response is None:
-            logger.warning(f"Sample {accessor.sample_id}: Missing verbalize_response in metadata.")
+        if not raw_response:
             return float('nan')
+            
+        # 剔除 prompt 尾巴带来的污染（如果有的话）
+        clean_text = raw_response.split("Confidence Score (0-1):")[-1]
         
-        # 3. 解析置信度
-        confidence = self._extract_confidence(raw_response)
-        
-        # 4. 转换：1.0 - 置信度 = 幻觉分 (对齐 Benchmark 指标)
+        confidence = self._extract_confidence(clean_text)
         return float(1.0 - confidence)

@@ -169,7 +169,7 @@ class QAHiddenStateExtractor:
             log_probs_full = torch.nn.functional.log_softmax(shift_logits, dim=-1)
             target_logprobs = torch.gather(log_probs_full, index=shift_labels.unsqueeze(-1), dim=-1).squeeze(-1)
             start_idx = max(0, prompt_len - 1)
-            ans_lps = target_logprobs[start_idx:].cpu().float().numpy().astype(np.float16)
+            ans_lps = target_logprobs[start_idx:].cpu().float().numpy().astype(np.float32)
 
         if method == "self_evaluator":
             next_token_logits = logits[0, -1, :] 
@@ -185,7 +185,7 @@ class QAHiddenStateExtractor:
             max_logit = max(logit_true, logit_false)
             prob_true = math.exp(logit_true - max_logit) / (math.exp(logit_true - max_logit) + math.exp(logit_false - max_logit) + 1e-9)
             
-            ans_lps = np.array([math.log(max(prob_true, 1e-9))]).astype(np.float16)
+            ans_lps = np.array([math.log(max(prob_true, 1e-9))]).astype(np.float32)
 
         hs_res = {}
         tw_res = {}
@@ -203,7 +203,7 @@ class QAHiddenStateExtractor:
             means = np.zeros(len(scores), dtype=np.float32)
             for l, v in enumerate(scores):
                 means[l] = float(np.mean(v)) if len(v) > 0 else 0.0
-            icr_feat = means.astype(np.float16)
+            icr_feat = means.astype(np.float32)
 
         target_layers = list(range(self.total_layers)) if extract_all_layers else [self.total_layers - 1]
         for l_idx in target_layers:
@@ -211,7 +211,7 @@ class QAHiddenStateExtractor:
             all_layer_hs = outputs.hidden_states[hf_l_idx][0]
             
             if method == "prism":
-                hs_res[l_idx] = all_layer_hs[-1, :].cpu().float().numpy().astype(np.float16)
+                hs_res[l_idx] = all_layer_hs[-1, :].cpu().float().numpy().astype(np.float32)
             else:
                 ans_hs = all_layer_hs[prompt_len:, :]
                 if self.pooling == "last":
@@ -221,14 +221,14 @@ class QAHiddenStateExtractor:
                     # 默认: 取回答所有 Token 的均值
                     target_hs = ans_hs.mean(dim=0)
                 
-                hs_res[l_idx] = target_hs.cpu().float().numpy().astype(np.float16)
+                hs_res[l_idx] = target_hs.cpu().float().numpy().astype(np.float32)
             
             if method == "icr_probe":
-                tw_res[l_idx] = ans_hs.cpu().float().numpy().astype(np.float16)
+                tw_res[l_idx] = ans_hs.cpu().float().numpy().astype(np.float32)
 
             if method == "sep":
-                tbg_feat = all_layer_hs[prompt_len - 1, :].cpu().float().numpy().astype(np.float16)
-                slt_feat = all_layer_hs[seq_len - 1, :].cpu().float().numpy().astype(np.float16)
+                tbg_feat = all_layer_hs[prompt_len - 1, :].cpu().float().numpy().astype(np.float32)
+                slt_feat = all_layer_hs[seq_len - 1, :].cpu().float().numpy().astype(np.float32)
                 sep_res[f"tbg_layer_{l_idx}"] = tbg_feat
                 sep_res[f"slt_layer_{l_idx}"] = slt_feat
 
@@ -499,7 +499,7 @@ class QAHiddenStateExtractor:
             log_probs_full = torch.nn.functional.log_softmax(shift_logits, dim=-1)
             target_logprobs = torch.gather(log_probs_full, index=shift_labels.unsqueeze(-1), dim=-1).squeeze(-1)
             start_idx = max(0, prompt_len - 1)
-            ans_lps = target_logprobs[start_idx:].cpu().float().numpy().astype(np.float16)
+            ans_lps = target_logprobs[start_idx:].cpu().float().numpy().astype(np.float32)
 
         if method == "self_evaluator":
             next_token_logits = logits[0, -1, :] 
@@ -515,7 +515,7 @@ class QAHiddenStateExtractor:
             max_logit = max(logit_true, logit_false)
             prob_true = math.exp(logit_true - max_logit) / (math.exp(logit_true - max_logit) + math.exp(logit_false - max_logit) + 1e-9)
             
-            ans_lps = np.array([math.log(max(prob_true, 1e-9))]).astype(np.float16)
+            ans_lps = np.array([math.log(max(prob_true, 1e-9))]).astype(np.float32)
 
         hs_res = {}
         tw_res = {}
@@ -533,7 +533,7 @@ class QAHiddenStateExtractor:
             means = np.zeros(len(scores), dtype=np.float32)
             for l, v in enumerate(scores):
                 means[l] = float(np.mean(v)) if len(v) > 0 else 0.0
-            icr_feat = means.astype(np.float16)
+            icr_feat = means.astype(np.float32)
 
         target_layers = list(range(self.total_layers)) if extract_all_layers else [self.total_layers - 1]
         for l_idx in target_layers:
@@ -541,7 +541,7 @@ class QAHiddenStateExtractor:
             all_layer_hs = outputs.hidden_states[hf_l_idx][0]
             
             if method == "prism":
-                hs_res[l_idx] = all_layer_hs[-1, :].cpu().float().numpy().astype(np.float16)
+                hs_res[l_idx] = all_layer_hs[-1, :].cpu().float().numpy().astype(np.float32)
             else:
                 ans_hs = all_layer_hs[prompt_len:, :]
                 if self.pooling == "last":
@@ -551,14 +551,14 @@ class QAHiddenStateExtractor:
                     # 默认: 取回答所有 Token 的均值
                     target_hs = ans_hs.mean(dim=0)
                 
-                hs_res[l_idx] = target_hs.cpu().float().numpy().astype(np.float16)
+                hs_res[l_idx] = target_hs.cpu().float().numpy().astype(np.float32)
             
             if method == "icr_probe":
-                tw_res[l_idx] = ans_hs.cpu().float().numpy().astype(np.float16)
+                tw_res[l_idx] = ans_hs.cpu().float().numpy().astype(np.float32)
 
             if method == "sep":
-                tbg_feat = all_layer_hs[prompt_len - 1, :].cpu().float().numpy().astype(np.float16)
-                slt_feat = all_layer_hs[seq_len - 1, :].cpu().float().numpy().astype(np.float16)
+                tbg_feat = all_layer_hs[prompt_len - 1, :].cpu().float().numpy().astype(np.float32)
+                slt_feat = all_layer_hs[seq_len - 1, :].cpu().float().numpy().astype(np.float32)
                 sep_res[f"tbg_layer_{l_idx}"] = tbg_feat
                 sep_res[f"slt_layer_{l_idx}"] = slt_feat
 

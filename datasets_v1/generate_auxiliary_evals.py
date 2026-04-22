@@ -3,10 +3,9 @@ import json
 import torch
 from typing import List, Dict, Any
 
-# 和你当前 stochastic 脚本保持一致的依赖风格
+# 完全对齐你的主干依赖
 from hidden_state import HiddenStateExtractor
 from prompt_builder import LLMPromptBuilder
-
 
 class AuxiliaryEvaluator(HiddenStateExtractor):
     """
@@ -14,16 +13,12 @@ class AuxiliaryEvaluator(HiddenStateExtractor):
       - verbalize_response
       - self_evaluator_raw
 
-    不做 stochastic sampling
-    不提取 hidden states
-    不写 H5
-    🚀 [重构版]：全面支持全局依赖注入 (Dependency Injection)，共享显存池。
+    不做 stochastic sampling，不提取 hidden states
+    🚀 [重构版]：全面支持全局依赖注入，与 HiddenStateExtractor 底层推理逻辑严格对齐！
     """
 
-    def __init__(self, model_name=None, model=None, tokenizer=None, model_kwargs=None):
-        """
-        🚀 [重构核心]: 依赖注入支持
-        """
+    def __init__(self, model_name=None, model=None, tokenizer=None, model_kwargs=None, **kwargs):
+        """支持从大管家直接注入模型，或者兜底自我加载"""
         if model is not None and tokenizer is not None:
             self.model_name = model_name or "injected_model"
             self.model = model
@@ -31,9 +26,7 @@ class AuxiliaryEvaluator(HiddenStateExtractor):
             self.device = next(model.parameters()).device
             self.model_kwargs = model_kwargs or {}
             
-            # ==========================================
-            # 🚨 [热修复补丁]: 保持与父类严格一致的属性完整性
-            # ==========================================
+            # 补齐父类属性
             if hasattr(self.model.config, "num_hidden_layers"):
                 self.total_layers = self.model.config.num_hidden_layers
             else:
@@ -41,23 +34,38 @@ class AuxiliaryEvaluator(HiddenStateExtractor):
 
             print(f"[*] AuxiliaryEvaluator 成功接收指挥官注入的模型实例 (设备: {self.device})")
         else:
-            super().__init__(model_name, model_kwargs)
-    def generate_single_response(self, prompt: str, max_new_tokens: int = 100) -> str:
-        """贪婪解码，和你现在 StochasticExtractor 里的行为保持一致。"""
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+            # 严格调用父类 HiddenStateExtractor 的初始化
+            super().__init__(model_name=model_name, model_kwargs=model_kwargs, **kwargs)
+
+    def _generate_text(self, chat_messages: List[Dict[str, str]], max_new_tokens: int) -> str:
+        """
+        🚀 核心生成器：严密对齐 HiddenStateExtractor.generate_and_extract 的 Tensor 构建方式
+        彻底解决 shape 报错，并压制无关 warning。
+        """
+        # 1. 渲染标准 Chat 文本 (绝不硬拼接)
+        prompt_str = self.tokenizer.apply_chat_template(chat_messages, tokenize=False, add_generation_prompt=True)
+        
+        # 2. Tokenize 构建 inputs
+        inputs = self.tokenizer(prompt_str, return_tensors="pt").to(self.device)
+        input_ids = inputs.input_ids
+        attention_mask = inputs.attention_mask
+        prompt_len = input_ids.shape[1]
+
+        # 3. Generate 推理 (与你 main pipeline 的传参方式一模一样)
         with torch.no_grad():
             outputs = self.model.generate(
-                **inputs,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
-                temperature=None,
-                top_p=None,
+                temperature=None,  # 显式关闭，压制警告
+                top_p=None,        # 显式关闭，压制警告
                 pad_token_id=self.tokenizer.pad_token_id
             )
-        return self.tokenizer.decode(
-            outputs[0][inputs.input_ids.shape[1]:],
-            skip_special_tokens=True
-        )
+        
+        # 4. Decode 截取新生成的 Token
+        new_tokens = outputs[0, prompt_len:]
+        return self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
     def _load_jsonl(self, path: str) -> List[Dict[str, Any]]:
         items = []
@@ -68,15 +76,12 @@ class AuxiliaryEvaluator(HiddenStateExtractor):
         return items
 
     def _load_existing_ids(self, output_jsonl_path: str) -> set:
-        """支持断点续跑：如果输出文件已存在，就跳过已经处理过的 sample_id。"""
         existing_ids = set()
         if not os.path.exists(output_jsonl_path):
             return existing_ids
-
         with open(output_jsonl_path, "r", encoding="utf-8") as f:
             for line in f:
-                if not line.strip():
-                    continue
+                if not line.strip(): continue
                 try:
                     d = json.loads(line)
                     if "sample_id" in d:
@@ -98,15 +103,6 @@ class AuxiliaryEvaluator(HiddenStateExtractor):
         self_eval_max_new_tokens: int = 150,
         overwrite: bool = False,
     ):
-        """
-        从主 metadata 文件中读取样本，单独生成 auxiliary eval 结果。
-        输出 JSONL 的每一行形如：
-        {
-          "sample_id": "...",
-          "verbalize_response": "...",        # 若开启
-          "self_evaluator_raw": "..."         # 若开启
-        }
-        """
         if not run_verbalize and not run_self_evaluator:
             raise ValueError("❌ 至少需要开启 run_verbalize 或 run_self_evaluator 中的一个。")
 
@@ -140,56 +136,45 @@ class AuxiliaryEvaluator(HiddenStateExtractor):
                         skipped_count += 1
                         continue
 
-                    print(f"[Main] Auxiliary 生成中: {sample_id}...")
+                    print(f"[Main] Auxiliary 判决生成中: {sample_id}...")
 
-                    # 和你当前 stochastic 流程保持一致：用同一个 PromptBuilder 还原主 prompt
-                    prompt_str = prompt_builder.build_prompt(
-                        target_item=item,
-                        few_shot_pool=dataset_items
-                    )
+                    out_item = {"sample_id": sample_id}
 
-                    out_item = {
-                        "sample_id": sample_id
-                    }
+                    # ==========================================
+                    # 🚀 终极解法：调用 _render_user_content 提取【纯净文本】
+                    # 绝对防止 <|begin_of_text|> 等特殊符产生嵌套污染！
+                    # ==========================================
+                    clean_question = prompt_builder._render_user_content(item["structured_data"])
+                    clean_answer = item.get('model_output_text', '')
 
-                    # verbalize：保持你当前 prompt 形式不变
+                    # 1. Verbalize (自信度评估)
                     if run_verbalize:
-                        v_prompt = (
-                            f"Question: {prompt_str}\n"
-                            f"Answer: {item['model_output_text']}\n"
-                            f"Confidence Score (0-1):"
-                        )
-                        out_item["verbalize_response"] = self.generate_single_response(
-                            v_prompt,
-                            max_new_tokens=verbalize_max_new_tokens
-                        )
+                        v_messages = [
+                            {"role": "system", "content": "You are a strict evaluator. Respond ONLY with a single float number between 0.0 and 1.0 representing your confidence in the provided answer. Do not output any other text."},
+                            {"role": "user", "content": f"Question: {clean_question}\n\nProposed Answer: {clean_answer}\n\nHow confident are you that this answer is completely correct? Score from 0.0 to 1.0:"}
+                        ]
+                        out_item["verbalize_response"] = self._generate_text(v_messages, verbalize_max_new_tokens)
 
-                    # self-evaluator：保持你当前 prompt 形式不变
+                    # 2. Self Evaluator (正误自评)
                     if run_self_evaluator:
-                        se_prompt = (
-                            f"Check consistency.\n"
-                            f"Question: {prompt_str}\n"
-                            f"Answer: {item['model_output_text']}\n"
-                            f"Final Grade (Correct/Incorrect):"
-                        )
-                        out_item["self_evaluator_raw"] = self.generate_single_response(
-                            se_prompt,
-                            max_new_tokens=self_eval_max_new_tokens
-                        )
+                        se_messages = [
+                            {"role": "system", "content": "You are a strict teacher grading a test. You must reply with either 'Correct' or 'Incorrect' at the very end of your response."},
+                            {"role": "user", "content": f"Question: {clean_question}\n\nProposed Answer: {clean_answer}\n\nEvaluate the proposed answer. Is it True or False? Final Grade (Correct/Incorrect):"}
+                        ]
+                        out_item["self_evaluator_raw"] = self._generate_text(se_messages, self_eval_max_new_tokens)
 
                     f_out.write(json.dumps(out_item, ensure_ascii=False) + "\n")
                     f_out.flush()
 
                     processed_count += 1
+                    
+                    # 保护显存：万条数据无忧
+                    torch.cuda.empty_cache()
 
         except KeyboardInterrupt:
             print("\n[!] 🛑 接收到打断信号，准备安全退出...")
         finally:
-            print(
-                f"[+] Auxiliary 生成安全退出！"
-                f"新增处理 {processed_count} 条，跳过 {skipped_count} 条已存在样本。"
-            )
-
+            print(f"[+] Auxiliary 生成安全退出！新增处理 {processed_count} 条，跳过 {skipped_count} 条已存在样本。")
 
 if __name__ == "__main__":
     evaluator = AuxiliaryEvaluator(

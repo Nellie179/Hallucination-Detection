@@ -4,35 +4,27 @@ import json
 import h5py
 import torch
 import math
-import gc  # 👈 必须引入
+import gc 
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer  # 👈 必须引入
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import random
 import numpy as np
 
 def set_global_seed(seed: int = 42):
     """全局随机种子固定：保证每次采样与特征提取绝对一致"""
-    # 1. 锁死 Python 内置随机性和 Hash 种子
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
-    
-    # 2. 锁死 Numpy 随机性
     np.random.seed(seed)
-    
-    # 3. 锁死 PyTorch 与 CUDA 随机性
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed) # 哪怕以后用多卡也能防住
-    
-    # 4. 锁死 CUDNN 后端确定性
+    torch.cuda.manual_seed_all(seed) 
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    
     print(f"[*] 全局随机种子已牢牢锁死为: {seed}")
 
 # ==========================================
-# 🎯 环境注入：挂载数据模块 (完美修复路径迷失)
+# 🎯 环境注入：挂载数据模块
 # ==========================================
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 data_dir = os.path.join(project_root, "datasets_v1")
@@ -51,20 +43,11 @@ from data_utils.extract_qa_hidden_states import process_dataset
 from data_utils.data_split import split_dataset 
 
 # ==========================================
-# 💎 评测全局配置中枢
-# ==========================================
-# ==========================================
 # ⚙️ 采样策略引擎 (双擎版)
 # ==========================================
-# 🐢 [教条模式]: 严格对齐 Semantic Entropy 原论文的低效代码。极慢，仅用于应对审稿人质疑。
 ACADEMIC_KWARGS = {"num_beams": 5, "do_sample": True, "temperature": 1.0}
-
-# 🚀 [极速模式]: 现代工业界标准核采样 (Nucleus Sampling)。提速 400%，多样性一致，日常冲刺专用！
 FAST_KWARGS = {"num_beams": 1, "do_sample": True, "temperature": 1.0, "top_p": 0.9}
 
-# ==========================================
-# 💎 评测全局配置中枢
-# ==========================================
 EVAL_CONFIG = {
     "num_samples": 5,
     "max_new_tokens": 2048,
@@ -73,29 +56,28 @@ EVAL_CONFIG = {
     "layer_config": {"mode": "middle", "count": 5},
     "token_config": {"mode": "backward", "count": 5},
     
-    # 🎯 核心开关：当前使用【极速模式】跑分
     "stochastic_gen_kwargs": FAST_KWARGS, 
-    "pooling_method": "mean",  ## choose from "mean" or "last"
-    "template_kwargs": {"enable_thinking": False}, ## Turning to False when using Qwen, others keep in True
+    "pooling_method": "mean", # 可选 "mean" 或 "last"
+    "template_kwargs": {"enable_thinking": False}, 
     "model_kwargs": {"trust_remote_code": True}
 }
 
-
-
 # =======================================================================================
-# 🚀 军工级核心：退二保底与断点续传容灾器 (Safe Resume Manager)
+# 🚀 军工级核心：退二保底无痕容灾器 (Clean Safe Resume) - 兼容死信队列(DLQ)版
 # =======================================================================================
 def enforce_safe_resume(base_meta_path, target_jsonl, target_h5, expected_total, rollback_count=2):
     """
-    检查 JSONL 和 H5 进度。如果不完整，切除末尾 rollback_count 个样本防脏数据，
-    返回一个只包含剩余样本的 temp_meta_path 供底层无缝追加。
+    检查进度并切除可能损坏的脏尾巴。
+    智能区分：
+    1. 中途断电 -> 执行 Rollback 物理切除脏尾巴
+    2. 留洞跑完 (OOM) -> 进入无损补洞模式，不删数据
     """
     ordered_items = []
     with open(base_meta_path, 'r', encoding='utf-8') as f:
         for line in f:
             if line.strip(): ordered_items.append(json.loads(line))
 
-    # 1. 扫描 JSONL 进度与验证完好性
+    # 1. 扫描已生成的 ID
     valid_json_lines = []
     json_ids = set()
     if target_jsonl and os.path.exists(target_jsonl):
@@ -106,11 +88,8 @@ def enforce_safe_resume(base_meta_path, target_jsonl, target_h5, expected_total,
                     data = json.loads(line)
                     json_ids.add(str(data["sample_id"]))
                     valid_json_lines.append(line)
-                except:
-                    print("    [!] 发现 JSONL 尾部结构断裂，将在回滚中物理截断。")
-                    break
+                except: break
 
-    # 2. 扫描 H5 进度 (宽容匹配)
     h5_ids = set()
     if target_h5 and os.path.exists(target_h5):
         try:
@@ -120,128 +99,70 @@ def enforce_safe_resume(base_meta_path, target_jsonl, target_h5, expected_total,
                     sid = str(item["sample_id"])
                     if sid in h5_keys or any(k.startswith(sid + "_") for k in h5_keys):
                         h5_ids.add(sid)
-        except Exception as e:
-            print(f"    [!] H5 文件尾部块可能损坏: {e}。将由 JSONL 进度主导修复。")
+        except Exception: pass
 
-    # 取进度交集（谁慢听谁的，保证对齐）
+    # 2. 核心补丁：查阅死信队列 (DLQ)，将确诊死亡的也算作进度
+    dlq_file = target_h5 + ".failed_ids.txt" if target_h5 else (target_jsonl + ".failed_ids.txt" if target_jsonl else None)
+    failed_ids = set()
+    if dlq_file and os.path.exists(dlq_file):
+        with open(dlq_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.strip():
+                    failed_ids.add(line.split('\t')[0].strip())
+    
+    # 进度交集 (谁慢听谁的)
     if target_jsonl and target_h5: processed_ids = json_ids.intersection(h5_ids)
     elif target_jsonl: processed_ids = json_ids
     elif target_h5: processed_ids = h5_ids
     else: processed_ids = set()
 
-    if len(processed_ids) == 0: return base_meta_path
+    # 有效总进度 = 成功录入 + 确诊死亡
+    effective_ids = processed_ids.union(failed_ids)
 
-    # 找到连续最高的安全位
+    if len(effective_ids) == 0: return True 
+
+    # 找到物理遍历达到的最高索引
     highest_idx = -1
     for i, item in enumerate(ordered_items):
-        if str(item["sample_id"]) in processed_ids:
+        if str(item["sample_id"]) in effective_ids:
             highest_idx = i
 
-    if len(processed_ids) >= expected_total and highest_idx == expected_total - 1:
-        return None # 100% 完成，不需要跑了
+    # 情况 A：100% 跑完 (成功 + 失败 = 预期总数)
+    if len(effective_ids) >= expected_total and highest_idx == expected_total - 1:
+        if failed_ids:
+            print(f"    [+] 进度 100% (其中 {len(failed_ids)} 条在死信队列中)，无需重复运行。")
+        return False 
 
-    # 3. 🚀 退二保底 (物理切除脏尾巴)
+    # 情况 B：虽然总数不够，但已经跑到了全量试卷的最后一条 (留洞模式)
+    if highest_idx == expected_total - 1:
+        missing = expected_total - len(effective_ids)
+        print(f"    🛠️ 发现进度已达末尾，但存在 {missing} 个样本空洞。触发无损补洞模式...")
+        return True # 直接下发原卷，让底层去补坑，绝对不执行 Rollback！
+
+    # 情况 C：中途物理断电 (Highest Index 未达末尾)
     safe_limit_idx = max(-1, highest_idx - rollback_count)
     safe_ids = set([str(item["sample_id"]) for item in ordered_items[:safe_limit_idx + 1]])
 
-    print(f"    🛠️ 发现进度中断 (当前有效至: {highest_idx + 1}/{expected_total})。执行退二保底清理 (-{rollback_count})...")
+    print(f"    🛠️ 发现进度中途物理中断 (断点: {highest_idx + 1}/{expected_total})。执行退二清理 (-{rollback_count})...")
 
-    # 切除 JSONL 脏尾
     if target_jsonl and os.path.exists(target_jsonl):
         with open(target_jsonl, 'w', encoding='utf-8') as f:
             for line in valid_json_lines:
                 try:
-                    if str(json.loads(line)["sample_id"]) in safe_ids:
-                        f.write(line)
+                    if str(json.loads(line)["sample_id"]) in safe_ids: f.write(line)
                 except: pass
 
-    # 切除 H5 脏尾
     if target_h5 and os.path.exists(target_h5):
         try:
             with h5py.File(target_h5, 'a') as f_h5:
                 for key in list(f_h5.keys()):
-                    is_safe = False
-                    for sid in safe_ids:
-                        if key == sid or key.startswith(sid + "_"):
-                            is_safe = True
-                            break
-                    if not is_safe:
-                        del f_h5[key] # 物理铲除坏块
-        except Exception as e:
-            print(f"    [!] H5 清理警告: {e}。若持续报错，文件可能已严重损坏。")
+                    # 这里注意：failed_ids 也可以被清理，因为如果是断电，我们希望干净地重跑
+                    if not any(key == sid or key.startswith(sid + "_") for sid in safe_ids):
+                        del f_h5[key]
+        except Exception: pass
 
-    # 4. 瞒天过海：生成续传专用的临时残卷
-    temp_meta_path = base_meta_path + ".resume_temp"
-    with open(temp_meta_path, 'w', encoding='utf-8') as f:
-        for item in ordered_items[safe_limit_idx + 1:]:
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
-
-    print(f"    [+] 切除完毕！准备从剩余 {expected_total - (safe_limit_idx + 1)} 条开始极速追加。")
-    return temp_meta_path
-
-def validate_stochastic_cache(jsonl_path: str, active_detectors: list, expected_total: int) -> bool:
-    """鲁棒性特征校验器：深度检查 JSONL 缓存文件的完整性。"""
-    if not os.path.exists(jsonl_path):
-        return False
-        
-    required_keys = ["sample_id"]
-    if any(getattr(d, "requires_stochastic", False) for d in active_detectors):
-        required_keys.append("stochastic_samples")
-        
-    try:
-        valid_count = 0
-        with open(jsonl_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                if not line.strip(): continue
-                data = json.loads(line)
-                if not all(k in data for k in required_keys):
-                    print(f"[-] 缓存失效: 样本 {data.get('sample_id')} 缺失关键字段，当前要求包含 {required_keys}")
-                    return False
-                if "stochastic_samples" in required_keys and not data.get("stochastic_samples"):
-                    print(f"[-] 缓存失效: 样本 {data.get('sample_id')} 的 stochastic_samples 为空")
-                    return False
-                valid_count += 1
-                
-        if valid_count < expected_total:
-            print(f"[-] 缓存失效: 样本数量不匹配 (当前缓存 {valid_count} 个，预期需要 {expected_total} 个)")
-            return False
-            
-        return True
-    except Exception as e:
-        print(f"[-] 缓存文件损坏或解析异常: {e}")
-        return False
-
-def validate_aux_cache(jsonl_path: str, active_detectors: list, expected_total: int) -> bool:
-    """校验 auxiliary eval 缓存文件完整性。"""
-    if not os.path.exists(jsonl_path):
-        return False
-
-    required_keys = ["sample_id"]
-    if any(d.name == "verbalize" for d in active_detectors):
-        required_keys.append("verbalize_response")
-    if any(d.name == "self_evaluator" for d in active_detectors):
-        required_keys.append("self_evaluator_raw")
-
-    try:
-        valid_count = 0
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                data = json.loads(line)
-                if not all(k in data for k in required_keys):
-                    print(f"[-] Auxiliary 缓存失效: 样本 {data.get('sample_id')} 缺失关键字段，当前要求包含 {required_keys}")
-                    return False
-                valid_count += 1
-
-        if valid_count < expected_total:
-            print(f"[-] Auxiliary 缓存失效: 样本数量不匹配 (当前缓存 {valid_count} 个，预期需要 {expected_total} 个)")
-            return False
-
-        return True
-    except Exception as e:
-        print(f"[-] Auxiliary 缓存文件损坏或解析异常: {e}")
-        return False
+    print(f"    [+] 尾部脏数据清理完毕！将由底层引擎自动跳过前 {len(safe_ids)} 条，进行无缝追加。")
+    return True 
 
 def get_detector(name: str):
     detectors_map = {
@@ -314,9 +235,8 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
             test_meta_path = os.path.join(exp_dir, "03_test.jsonl")
             
             if not os.path.exists(train_meta_path) or not os.path.exists(test_meta_path):
-                print(f"\n[*] 检测到缺失数据集切分文件，大管家正在自动执行 Train/Val/Test 严格切分...")
+                print(f"\n[*] 自动执行 Train/Val/Test 严格切分...")
                 split_dataset(input_jsonl=base_meta_path, exp_dir=exp_dir)
-                print(f"[+] 数据集切分完成！\n")
 
             st_jsonl_path = os.path.join(exp_dir, "04_stochastic_samples.jsonl")
             st_h5_path = os.path.join(exp_dir, "04_stochastic_hidden_states.h5")
@@ -328,9 +248,6 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
             with open(base_meta_path, 'r', encoding='utf-8') as f_meta:
                 expected_total = sum(1 for _ in f_meta)
 
-            # =========================================================================
-            # 🌟 [重构核心]: 两栖作战模式 - 按需懒加载模型闭包 (Lazy Loading)
-            # =========================================================================
             sdpa_model, sdpa_tokenizer = None, None
             eager_model, eager_tokenizer = None, None
 
@@ -342,9 +259,7 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
                     if sdpa_tokenizer.pad_token is None: sdpa_tokenizer.pad_token = sdpa_tokenizer.eos_token
                     kwargs = EVAL_CONFIG["model_kwargs"].copy()
                     kwargs["attn_implementation"] = "sdpa"
-                    sdpa_model = AutoModelForCausalLM.from_pretrained(
-                        target_model, device_map="auto", torch_dtype=torch.bfloat16, **kwargs
-                    ).eval()
+                    sdpa_model = AutoModelForCausalLM.from_pretrained(target_model, device_map="auto", torch_dtype=torch.bfloat16, **kwargs).eval()
                 return sdpa_model, sdpa_tokenizer
 
             def get_eager_model():
@@ -355,185 +270,103 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
                     if eager_tokenizer.pad_token is None: eager_tokenizer.pad_token = eager_tokenizer.eos_token
                     kwargs = EVAL_CONFIG["model_kwargs"].copy()
                     kwargs["attn_implementation"] = "eager"
-                    eager_model = AutoModelForCausalLM.from_pretrained(
-                        target_model, device_map="auto", torch_dtype=torch.bfloat16, **kwargs
-                    ).eval()
+                    eager_model = AutoModelForCausalLM.from_pretrained(target_model, device_map="auto", torch_dtype=torch.bfloat16, **kwargs).eval()
                 return eager_model, eager_tokenizer
-            # =========================================================================
-
-            # -------------------------------------------------------------------------
-            # 🚀 [相位 1] 极速突击阶段 (所有走 SDPA 的提取逻辑)
-            # -------------------------------------------------------------------------
 
             # 【1.1】采样引擎
             if need_stochastic:
-                print(f"[*] 执行阶段 1 缓存完整性校验...")
-                is_cache_valid = validate_stochastic_cache(st_jsonl_path, active_detectors, expected_total)
-                
-                if not is_cache_valid:
-                    print(f"[!] 校验未通过：即将启动高级采样引擎进行全量重构...")
-                    for dirty_file in [st_jsonl_path, st_h5_path]:
-                        if os.path.exists(dirty_file):
-                            os.remove(dirty_file)
-                            print(f"  - 已清理历史脏数据: {os.path.basename(dirty_file)}")
-
-                    m, t = get_sdpa_model()  # 👈 触发 SDPA 加载
+                print(f"[*] 执行阶段 1 采样引擎缓存与断点校验...")
+                if enforce_safe_resume(base_meta_path, st_jsonl_path, st_h5_path if need_stochastic_hs else None, expected_total):
+                    m, t = get_sdpa_model()
                     extractor = StochasticExtractor(model_name=target_model, model=m, tokenizer=t, model_kwargs=EVAL_CONFIG["model_kwargs"])
                     extractor.process_stochastic_from_file(
-                        input_jsonl_path=base_meta_path, output_h5_path=st_h5_path, output_jsonl_path=st_jsonl_path,
+                        input_jsonl_path=base_meta_path, # 直接下发原卷
+                        output_h5_path=st_h5_path, output_jsonl_path=st_jsonl_path,
                         layer_config=EVAL_CONFIG["layer_config"], token_config=EVAL_CONFIG["token_config"],
                         max_new_tokens=EVAL_CONFIG["max_new_tokens"], num_samples=EVAL_CONFIG["num_samples"],
                         system_prompt=EVAL_CONFIG["system_prompt"], num_shots=EVAL_CONFIG["num_shots"],
                         generation_kwargs=EVAL_CONFIG["stochastic_gen_kwargs"], template_kwargs=EVAL_CONFIG["template_kwargs"],
-                        run_verbalize=False, run_self_evaluator=False,
-                        extract_stochastic_hs=need_stochastic_hs
+                        run_verbalize=False, run_self_evaluator=False, extract_stochastic_hs=need_stochastic_hs
                     )
                     del extractor
                     torch.cuda.empty_cache()
-                else:
-                    print(f"[+] 采样缓存校验通过！完全满足当前 {len(active_detectors)} 个探测器的严苛要求，直接复用。")
 
-            # 【1.2】auxiliary eval 引擎
+            # 【1.2】Auxiliary Eval
             if need_aux_eval:
-                print(f"[*] 执行阶段 1.2 Auxiliary 缓存完整性校验...")
-                is_aux_cache_valid = validate_aux_cache(aux_jsonl_path, active_detectors, expected_total)
-
-                if not is_aux_cache_valid:
-                    print(f"[!] Auxiliary 校验未通过：即将启动独立生成引擎...")
-                    if os.path.exists(aux_jsonl_path):
-                        os.remove(aux_jsonl_path)
-                        print(f"  - 已清理历史脏数据: {os.path.basename(aux_jsonl_path)}")
-
-                    m, t = get_sdpa_model()  # 👈 触发 SDPA 加载
+                print(f"[*] 执行阶段 1.2 Auxiliary 缓存与断点校验...")
+                if enforce_safe_resume(base_meta_path, aux_jsonl_path, None, expected_total):
+                    m, t = get_sdpa_model()
                     aux_evaluator = AuxiliaryEvaluator(model_name=target_model, model=m, tokenizer=t, model_kwargs=EVAL_CONFIG["model_kwargs"])
                     aux_evaluator.process_auxiliary_from_file(
                         input_jsonl_path=base_meta_path,
                         output_jsonl_path=aux_jsonl_path,
-                        system_prompt=EVAL_CONFIG["system_prompt"],
-                        num_shots=EVAL_CONFIG["num_shots"],
+                        system_prompt=EVAL_CONFIG["system_prompt"], num_shots=EVAL_CONFIG["num_shots"],
                         template_kwargs=EVAL_CONFIG["template_kwargs"],
-                        run_verbalize=("verbalize" in baselines),
-                        run_self_evaluator=("self_evaluator" in baselines),
+                        run_verbalize=("verbalize" in baselines), run_self_evaluator=("self_evaluator" in baselines),
                     )
                     del aux_evaluator
                     torch.cuda.empty_cache()
-                else:
-                    print(f"[+] Auxiliary 缓存校验通过！直接复用。")
 
-            # 【1.5】全自动造子弹 (base_logit_recovery)
-            if need_logprobs and not os.path.exists(recovery_h5_path):
-                print(f"\n[*] 启动 'base_logit_recovery' 独立补票...")
-                m, t = get_sdpa_model()  # 👈 触发 SDPA 加载
-                process_dataset(input_jsonl=base_meta_path, output_h5=recovery_h5_path, model_name=target_model, method="base_logit_recovery", model_kwargs=EVAL_CONFIG["model_kwargs"], model=m, tokenizer=t, pooling=EVAL_CONFIG.get("pooling_method", "mean"))
-                torch.cuda.empty_cache()
+            # 【1.5】Logit Recovery (SAPLMA/HaloScope 基础特征)
+            if need_logprobs:
+                print(f"\n[*] 扫描 'base_logit_recovery' 补票进度...")
+                if enforce_safe_resume(base_meta_path, None, recovery_h5_path, expected_total):
+                    m, t = get_sdpa_model()
+                    process_dataset(input_jsonl=base_meta_path, output_h5=recovery_h5_path, model_name=target_model, method="base_logit_recovery", model_kwargs=EVAL_CONFIG["model_kwargs"], model=m, tokenizer=t, pooling=EVAL_CONFIG.get("pooling_method", "mean"))
+                    torch.cuda.empty_cache()
 
-            # 【1.6】SDPA 适用的探测器提取
+            # 【1.6】其他 SDPA 探测器
             for det in active_detectors:
-                # 排除 saplma 和 icr_probe
-                if getattr(det, "requires_qa_features", False) and det.name not in ["saplma", "icr_probe", "haloscope"]:
+                if getattr(det, "requires_qa_features", False) and det.name not in ["saplma", "icr_probe", "haloscope", "mind"]:
                     qa_path = os.path.join(exp_dir, f"05_qa_features_{det.name}.h5")
-                    need_extract = False
-                    if not os.path.exists(qa_path):
-                        need_extract = True
-                    else:
-                        try:
-                            with h5py.File(qa_path, 'r') as f_check:
-                                all_keys = list(f_check.keys())
-                                if not all_keys or len(all_keys) < expected_total:
-                                    print(f"[*] 发现 {det.name} 特征不完整 (当前 {len(all_keys)} 个，预期 {expected_total} 个)！准备重跑...")
-                                    need_extract = True
-                                else:
-                                    sample_grp = f_check[all_keys[0]]
-                                    if det.name == "self_evaluator" and "logprobs" not in sample_grp:
-                                        print(f"[*] 检测到 {det.name} 缺失对数概率 (logprobs)，准备重跑...")
-                                        need_extract = True
-                                    elif det.name == "sep" and "sep_points" not in sample_grp:
-                                        print(f"[*] 检测到 {det.name} 核心字段缺失 (sep_points)，准备重跑...")
-                                        need_extract = True
-                        except Exception as e:
-                            print(f"[*] 发现 {det.name} 特征文件已损坏，准备重跑提取...")
-                            need_extract = True
-
-                    if need_extract:
-                        print(f"\n[*] 启动 {det.name} 专属特征提取引擎...")
-                        m, t = get_sdpa_model()  # 👈 触发 SDPA 加载
+                    print(f"\n[*] 扫描 {det.name} 专属特征提取进度...")
+                    if enforce_safe_resume(base_meta_path, None, qa_path, expected_total):
+                        m, t = get_sdpa_model()
                         process_dataset(input_jsonl=base_meta_path, output_h5=qa_path, model_name=target_model, method=det.name, model_kwargs=EVAL_CONFIG["model_kwargs"], model=m, tokenizer=t, pooling=EVAL_CONFIG.get("pooling_method", "mean"))
                         torch.cuda.empty_cache()
 
-            # 🧹 [清洗 SDPA 显存]
             if sdpa_model is not None:
-                print(f"\n[Commander] SDPA 相位任务全部完成，正在释放极速显存...")
                 del sdpa_model, sdpa_tokenizer
                 gc.collect()
                 torch.cuda.empty_cache()
 
-            # -------------------------------------------------------------------------
-            # 🚀 [相位 2] 深度分析阶段 (只针对 icr_probe 走 Eager 逻辑)
-            # -------------------------------------------------------------------------
+            # 【相位 2】Eager 模式 (ICR Probe)
             for det in active_detectors:
                 if getattr(det, "requires_qa_features", False) and det.name == "icr_probe":
                     qa_path = os.path.join(exp_dir, f"05_qa_features_{det.name}.h5")
-                    need_extract = False
-                    if not os.path.exists(qa_path):
-                        need_extract = True
-                    else:
-                        try:
-                            with h5py.File(qa_path, 'r') as f_check:
-                                all_keys = list(f_check.keys())
-                                if not all_keys or len(all_keys) < expected_total:
-                                    print(f"[*] 发现 {det.name} 特征不完整，准备重跑...")
-                                    need_extract = True
-                                else:
-                                    sample_grp = f_check[all_keys[0]]
-                                    if "icr_feature" not in sample_grp:
-                                        print(f"[*] 检测到 {det.name} 核心字段缺失，准备重跑...")
-                                        need_extract = True
-                        except Exception as e:
-                            print(f"[*] 发现 {det.name} 特征文件已损坏，准备重跑提取...")
-                            need_extract = True
-
-                    if need_extract:
-                        print(f"\n[*] 启动 {det.name} 专属特征提取引擎 (Eager 模式)...")
-                        m, t = get_eager_model()  # 👈 触发 EAGER 加载
+                    print(f"\n[*] 扫描 {det.name} (Eager) 提取进度...")
+                    if enforce_safe_resume(base_meta_path, None, qa_path, expected_total):
+                        m, t = get_eager_model()
                         process_dataset(input_jsonl=base_meta_path, output_h5=qa_path, model_name=target_model, method=det.name, model_kwargs=EVAL_CONFIG["model_kwargs"], model=m, tokenizer=t, pooling=EVAL_CONFIG.get("pooling_method", "mean"))
                         torch.cuda.empty_cache()
 
-            # 🧹 [清洗 Eager 显存]
             if eager_model is not None:
-                print(f"\n[Commander] Eager 相位任务全部完成，正在释放深度分析显存...")
                 del eager_model, eager_tokenizer
                 gc.collect()
                 torch.cuda.empty_cache()
 
-            # -------------------------------------------------------------------------
-            # 🚀 [相位 3] 纯离线特征加载与评测算分 (无需任何模型加载)
-            # -------------------------------------------------------------------------
-            print(f"\n[*] 加载数据特征 (建立 Train / Test 屏障)...")
+            # 【相位 3】纯离线评测
+            print(f"\n[*] 加载离线特征中...")
             st_dict = {}
             if os.path.exists(st_jsonl_path):
                 with open(st_jsonl_path, 'r', encoding='utf-8') as f:
                     for line in f:
-                        d = json.loads(line)
-                        st_dict[str(d["sample_id"])] = {
-                            "samples": d.get("stochastic_samples", []), 
-                            "log_likelihoods": d.get("stochastic_log_likelihoods", [])
-                        }
+                        if line.strip():
+                            d = json.loads(line)
+                            st_dict[str(d["sample_id"])] = {"samples": d.get("stochastic_samples", []), "log_likelihoods": d.get("stochastic_log_likelihoods", [])}
 
             aux_dict = {}
             if os.path.exists(aux_jsonl_path):
                 with open(aux_jsonl_path, 'r', encoding='utf-8') as f:
                     for line in f:
-                        d = json.loads(line)
-                        aux_dict[str(d["sample_id"])] = {
-                            "verbalize_response": d.get("verbalize_response"),
-                            "self_evaluator_raw": d.get("self_evaluator_raw")
-                        }
+                        if line.strip():
+                            d = json.loads(line)
+                            aux_dict[str(d["sample_id"])] = {"verbalize_response": d.get("verbalize_response"), "self_evaluator_raw": d.get("self_evaluator_raw")}
 
             recovery_dict = {}
             if os.path.exists(recovery_h5_path):
                 with h5py.File(recovery_h5_path, 'r') as rec_h5:
-                    for group_name in rec_h5.keys():
-                        recovery_dict[group_name.replace("_base_logit_recovery", "")] = rec_h5[group_name]["logprobs"][:]
+                    for k in rec_h5.keys(): recovery_dict[k.replace("_base_logit_recovery", "")] = rec_h5[k]["logprobs"][:]
 
             base_h5 = h5py.File(base_h5_path, 'r') if os.path.exists(base_h5_path) else None
             st_h5 = h5py.File(st_h5_path, 'r') if os.path.exists(st_h5_path) else None
@@ -541,34 +374,31 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
             qa_h5_handles = {}
             for det in active_detectors:
                 if getattr(det, "requires_qa_features", False):
-                    if det.name in ["saplma", "haloscope"]:
-                        qa_h5_handles[det.name] = h5py.File(recovery_h5_path, 'r')
-                        continue
-                    qa_path = os.path.join(exp_dir, f"05_qa_features_{det.name}.h5")
-                    if os.path.exists(qa_path): qa_h5_handles[det.name] = h5py.File(qa_path, 'r')
+                    if det.name in ["saplma", "haloscope"]: qa_h5_handles[det.name] = h5py.File(recovery_h5_path, 'r')
+                    elif det.name == "mind": continue
+                    else:
+                        qa_path = os.path.join(exp_dir, f"05_qa_features_{det.name}.h5")
+                        if os.path.exists(qa_path): qa_h5_handles[det.name] = h5py.File(qa_path, 'r')
 
-            # 🚀 按花名册提人
             train_accessors = build_accessors(train_meta_path, base_h5, st_dict, st_h5, recovery_dict, aux_dict)
             test_accessors = build_accessors(test_meta_path, base_h5, st_dict, st_h5, recovery_dict, aux_dict)
 
-            print(f"[*] 数据隔离完毕。Train: {len(train_accessors)} 个 | Test: {len(test_accessors)} 个")
+            print(f"[*] 数据隔离完毕。Train: {len(train_accessors)} | Test: {len(test_accessors)}")
 
-            # 【阶段 3】打分流程
             raw_scores = {acc.sample_id: {} for acc in test_accessors}
             for detector in active_detectors:
                 print(f"\n>>> {detector.name} 运行中...")
-                if getattr(detector, "requires_qa_features", False):
+                if getattr(detector, "requires_qa_features", False) and detector.name != "mind":
                     target_h5 = qa_h5_handles.get(detector.name)
                     for acc in train_accessors + test_accessors:
                         acc.qa_h5_file = target_h5
                         acc.method_type = "base_logit_recovery" if detector.name in ["saplma", "haloscope"] else detector.name
                 
                 detector.fit(train_accessors)
-                for acc in tqdm(test_accessors, desc="Scoring on Test Set", leave=False):
+                for acc in tqdm(test_accessors, desc="Scoring", leave=False):
                     raw_scores[acc.sample_id][detector.name] = detector.predict_score(acc)
 
-            # 【阶段 4】最终算分
-            print(f"\n[*] 写入实验报告 (仅限测试集)...")
+            # 报告输出
             final_report = {"metrics": {}, "raw_scores": raw_scores}
             for det in active_detectors:
                 y_true, y_pred = [], []
@@ -583,33 +413,19 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
                 if y_true and len(set(y_true)) > 1:
                     m = ClassificationEvaluator.compute_metrics(y_true, y_pred)
                     final_report["metrics"][det.name] = m
-                    print(f"  - [{det.name:20}] AUROC: {m['AUROC']:.2f}% (测试样本: {len(y_true)})")
+                    print(f"  - [{det.name:20}] AUROC: {m['AUROC']:.2f}%")
 
-            with open(final_report_path, 'w', encoding='utf-8') as f:
-                json.dump(final_report, f, ensure_ascii=False, indent=2)
+            with open(final_report_path, 'w', encoding='utf-8') as f: json.dump(final_report, f, indent=2)
 
             if base_h5: base_h5.close()
             if st_h5: st_h5.close()
-            for h in qa_h5_handles.values():
-                if h: h.close()
+            for h in qa_h5_handles.values(): h.close()
 
 if __name__ == "__main__":
     set_global_seed(42)
     run_benchmark(
-        target_models=["meta-llama/Llama-3.2-3B-Instruct"],
-        datasets=["belebele"
-            # "truthful_qa",
-            # "halueval_qa",
-            # "trivia_qa",
-            # "coqa",
-            # "squad_v2",
-            # "arc_challenge",
-            # "xsum",
-            # "gsm8k",
-            # "human_eval",
-            # "xlam_agent",
-            # "mbpp"
-        ],
+        target_models=["meta-llama/Llama-3.1-8B-Instruct"],
+        datasets=["svamp"],
         baselines=[
             "selfcheck_bertscore",
             "selfcheck_nli",
@@ -626,6 +442,7 @@ if __name__ == "__main__":
             "sep",
             "icr_probe",
             "mind",
-            "sar"
+            "sar",
+            "haloscope"
         ] 
     )
