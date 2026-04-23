@@ -75,7 +75,7 @@ class TSVFeatureExtractor:
         input_jsonl_path: str,
         output_jsonl_path: str,
         num_train_samples: int = 500,
-        epochs: int = 5,
+        epochs: int = 40,
         batch_size: int = 8,
         lr: float = 0.005,
         str_layer: int = 9,
@@ -109,36 +109,70 @@ class TSVFeatureExtractor:
         # 质心初始化 (float32)
         centroids = F.normalize(torch.randn((2, hidden_size), dtype=torch.float32).to(self.device), p=2, dim=1)
 
-        self.model.eval() 
-        for epoch in range(epochs):
-            indices = torch.randperm(len(train_p)).tolist()
-            cur_p = [train_p[idx] for idx in indices]
-            cur_l = [train_l[idx] for idx in indices]
+        self.model.eval()
+        # =========================================================
+        # 🚀 钩子 1：引燃火种，强行从 Embedding 赋予梯度，逼迫 PyTorch 建图
+        # =========================================================
+        def force_grad_hook(module, inp, out):
+            out.requires_grad_(True)
+        emb_hook = self.model.get_input_embeddings().register_forward_hook(force_grad_hook)
 
-            pbar = tqdm(range(0, len(cur_p), batch_size), desc=f"TSV Train Ep {epoch+1}")
-            for start in pbar:
-                batch_p, batch_l = cur_p[start:start+batch_size], cur_l[start:start+batch_size]
-                b_in, b_labels_t = collate_fn(batch_p, batch_l, self.tokenizer.pad_token_id)
-                b_in, b_labels_t = b_in.to(self.device), b_labels_t.to(self.device)
-                
-                # sdpa 兼容推理
-                output = self.model(b_in, output_hidden_states=True)
-                # 精准提取，它在哪张卡上就在哪张卡上算，完全避开堆叠冲突
-                target_hidden = output.hidden_states[str_layer]
-                # 转 float32 算 Loss
-                last_token_rep = get_last_non_padded_token_rep(target_hidden, (b_in != self.tokenizer.pad_token_id)).to(torch.float32)
-                
-                b_labels_oh = F.one_hot(b_labels_t, num_classes=2).to(torch.float32)
-                ot_loss, _ = compute_ot_loss_cos(last_token_rep, centroids, b_labels_oh, len(batch_p), args)
-                
-                ot_loss.backward()
-                optimizer.step()
-                optimizer.zero_grad()
-                
-                with torch.no_grad():
-                    centroids = update_centroids_ema_hard(centroids, last_token_rep, b_labels_oh, args)
-                pbar.set_postfix({"loss": f"{ot_loss.item():.4f}"})
+        # =========================================================
+        # 🚀 钩子 2：窃听器，直接抓取 TSV 层输出，彻底绕开多卡 Detach 黑洞
+        # =========================================================
+        tracked_hiddens = []
+        def intercept_hook(module, input, output):
+            tracked_hiddens.append(output)
+            
+        layers = get_layers(self.model)
+        hook_handle = layers[str_layer].tsv_layer.register_forward_hook(intercept_hook)
 
+        # =========================================================
+        # 🚀 终极破局点：强制开启梯度引擎！冲破 runner.py 的全局封锁
+        # =========================================================
+        with torch.enable_grad():
+            for epoch in range(epochs):
+                indices = torch.randperm(len(train_p)).tolist()
+                cur_p = [train_p[idx] for idx in indices]
+                cur_l = [train_l[idx] for idx in indices]
+
+                pbar = tqdm(range(0, len(cur_p), batch_size), desc=f"TSV Train Ep {epoch+1}")
+                for start in pbar:
+                    batch_p, batch_l = cur_p[start:start+batch_size], cur_l[start:start+batch_size]
+                    b_in, b_labels_t = collate_fn(batch_p, batch_l, self.tokenizer.pad_token_id)
+                    b_in = b_in.to(self.device)
+                    
+                    # 每次前向传播前，清空窃听口袋
+                    tracked_hiddens.clear()
+                    
+                    # ⚠️ 必须关闭 output_hidden_states，切断底层原生 Tuple 收集以防断流！
+                    _ = self.model(b_in, output_hidden_states=False)
+                    
+                    # 🚀 直接从 Hook 口袋里拿出绝对带有梯度的隐藏层张量
+                    target_hidden = tracked_hiddens[0]
+                    
+                    # 🚀 修复点 2：将掩码对齐到目标隐藏层所在的具体显卡 (防御 H200 跨卡报错)
+                    attn_mask = (b_in != self.tokenizer.pad_token_id).to(target_hidden.device)
+                    last_token_rep = get_last_non_padded_token_rep(target_hidden, attn_mask).to(torch.float32)
+                    
+                    # 🚀 修复点 3：算 Loss 前将其他变量跨卡运输对齐
+                    centroids_dev = centroids.to(target_hidden.device)
+                    b_labels_oh = F.one_hot(b_labels_t.to(target_hidden.device), num_classes=2).to(torch.float32)
+                    
+                    ot_loss, _ = compute_ot_loss_cos(last_token_rep, centroids_dev, b_labels_oh, len(batch_p), args)
+                    
+                    ot_loss.backward()
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    
+                    with torch.no_grad():
+                        # 更新全局质心时，带回主卡
+                        centroids = update_centroids_ema_hard(centroids, last_token_rep.to(self.device), b_labels_oh.to(self.device), args)
+                    pbar.set_postfix({"loss": f"{ot_loss.item():.4f}"})
+
+        # 🚀 训练结束，立刻拆除所有钩子，还原大模型清白之身
+        emb_hook.remove()
+        hook_handle.remove()
         # --- 阶段 2: 全量推理并存分 ---
         print("[*] 训练完成，开始全自动特征落盘...")
         for p in tsv_params.parameters(): p.requires_grad = False
