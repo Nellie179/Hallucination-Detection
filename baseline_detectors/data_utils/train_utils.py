@@ -1,9 +1,7 @@
-
 import torch
 from tqdm import tqdm
 from torch.cuda.amp import autocast
 import torch.nn.functional as F
-
 
 
 def collate_fn(prompts, labels):
@@ -28,17 +26,37 @@ def collate_fn(prompts, labels):
     return prompts_padded, labels
 
 
-def get_last_non_padded_token_rep(hidden_states, attention_mask):
+def get_last_non_padded_token_rep(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
     """
-    Get the last non-padded token's representation for each sequence in the batch.
+    鲁棒提取最后一个非 PADDING Token 的隐藏层特征。
+    基于防御性编程，免疫 Batch Size=1、全 Pad 脏数据、以及多维张量漂移。
     """
-    # Find the length of each sequence by summing the attention mask (1 for real tokens, 0 for padding)
-    lengths = attention_mask.squeeze().sum(dim=1).long()
-
-    # Index the last non-padded token for each sequence
-    batch_size, max_seq_len, hidden_size = hidden_states.size()
-    last_token_reps = torch.stack([hidden_states[i, lengths[i]-1, :] for i in range(batch_size)])
-
+    # 🛡️ 防御 1：强制维度收敛。不管外层传进来的是 1D, 2D 还是被 unsqueeze 过的 3D 掩码
+    # 强行规范化为标准的 (Batch, SeqLen)
+    if attention_mask.dim() == 3:
+        attention_mask = attention_mask.squeeze(-1)
+    elif attention_mask.dim() == 1:
+        attention_mask = attention_mask.unsqueeze(0)
+        
+    if hidden_states.dim() == 2:
+        hidden_states = hidden_states.unsqueeze(0)
+        
+    batch_size = hidden_states.size(0)
+        
+    # 🛡️ 防御 2：死锁最后一维求和
+    # sum(dim=-1) 永远只对最后一个维度（SeqLen）求和，彻底断绝 squeeze() 挤没 Batch 维度的可能
+    lengths = attention_mask.sum(dim=-1).long()
+    
+    # 🛡️ 防御 3：下界钳制 (Clamp) 机制
+    # 如果数据极脏，某条序列全是 Pad (length=0)，lengths-1 会变成 -1，导致错误取到队尾！
+    # 强行钳制最小值为 0，即使全脏数据，也安全返回第 0 个 token 的特征，绝不让程序中断
+    last_indices = torch.clamp(lengths - 1, min=0)
+    
+    # 🛡️ 防御 4：高级坐标索引 (Advanced Indexing) 替代切片
+    # 避开容易报错且极其耗费显存的 torch.gather 或 torch.stack 循环
+    batch_coords = torch.arange(batch_size, device=hidden_states.device)
+    last_token_reps = hidden_states[batch_coords, last_indices, :]
+    
     return last_token_reps
 
 
