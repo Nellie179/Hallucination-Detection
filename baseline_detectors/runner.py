@@ -233,9 +233,10 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
             
             base_meta_path = os.path.join(exp_dir, "03_final_scored_metadata.jsonl")
             train_meta_path = os.path.join(exp_dir, "03_train.jsonl")
+            val_meta_path = os.path.join(exp_dir, "03_val.jsonl")   # ✨ 修正：定义验证集路径
             test_meta_path = os.path.join(exp_dir, "03_test.jsonl")
             
-            if not os.path.exists(train_meta_path) or not os.path.exists(test_meta_path):
+            if not os.path.exists(train_meta_path) or not os.path.exists(val_meta_path) or not os.path.exists(test_meta_path):
                 print(f"\n[*] 自动执行 Train/Val/Test 严格切分...")
                 split_dataset(input_jsonl=base_meta_path, exp_dir=exp_dir)
 
@@ -327,38 +328,98 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
                         torch.cuda.empty_cache()
 
             # ==========================================================
-            # 🚀 【1.7】TSV 任务引导向量全自动训练与提取 (白嫖当前 SDPA 模型)
+            # 🚀 【1.7】TSV: Train 训练 -> Val 扫层 -> Test 拔插推理
             # ==========================================================
             if "tsv" in baselines:
                 tsv_path = os.path.join(exp_dir, "05_qa_features_tsv.jsonl")
-                # 检查是否已有缓存，避免重跑
+                
                 if not os.path.exists(tsv_path):
-                    print(f"\n[*] 启动 TSV 专属特征提取引擎 (注入当前 SDPA 全局模型)...")
-                    
-                    # 🚀 关键：直接调用你架构里的 get_sdpa_model()，它会自动返回已加载的模型
+                    print(f"\n[*] 启动 TSV 纯正全监督管线 (Train -> Val Sweep -> Test Insert)...")
                     m, t = get_sdpa_model() 
-                    
                     from baseline_detectors.data_utils.extract_tsv_features import TSVFeatureExtractor
-                    tsv_extractor = TSVFeatureExtractor(
-                        model_name=target_model, 
-                        model=m, 
-                        tokenizer=t
+                    tsv_extractor = TSVFeatureExtractor(model_name=target_model, model=m, tokenizer=t)
+                    
+                    sweep_layers = [9, 11, 13, 15, 17, 19] # Llama-3-8B 推荐扫 15-25 层
+                    best_layer = -1
+                    best_val_auroc = 0.0
+                    
+                    # 保存最佳外挂插件的变量
+                    best_trained_vector = None
+                    best_centroids = None
+                    
+                    # 预先读取 Val 集标签用于计算 AUROC
+                    val_labels = {}
+                    with open(val_meta_path, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            d = json.loads(line)
+                            if d.get("eval_category") in ["correct", "hallucination"]:
+                                val_labels[str(d["sample_id"])] = 1 if d["eval_category"] == "hallucination" else 0
+
+                    from sklearn.metrics import roc_auc_score
+                    
+                    # === Phase A: Val 扫层寻找最佳 Vector ===
+                    for current_layer in sweep_layers:
+                        # 1. 在 Train 集上训练，拿到当前层的插件
+                        trained_vec, centroids = tsv_extractor.train_vector(
+                            train_jsonl_path=train_meta_path, 
+                            str_layer=current_layer
+                        )
+                        
+                        # 2. 将插件插回，在 Val 集上测试
+                        temp_val_tsv = os.path.join(exp_dir, f"temp_val_layer{current_layer}.jsonl")
+                        tsv_extractor.evaluate_vector(
+                            eval_jsonl_path=val_meta_path, 
+                            output_jsonl_path=temp_val_tsv, 
+                            trained_vector=trained_vec, 
+                            final_centroids=centroids, 
+                            str_layer=current_layer
+                        )
+                        
+                        # 3. 计算 Val AUROC
+                        y_true, y_pred = [], []
+                        with open(temp_val_tsv, 'r', encoding='utf-8') as f_val:
+                            for line in f_val:
+                                d = json.loads(line)
+                                sid = str(d.get("sample_id"))
+                                score = d.get("tsv_hallucination_score")
+                                if sid in val_labels and score is not None:
+                                    y_true.append(val_labels[sid])
+                                    y_pred.append(float(score))
+                                    
+                        if len(set(y_true)) > 1:
+                            val_auroc = roc_auc_score(y_true, y_pred)
+                            print(f"    👉 [扫层] Layer {current_layer} | Val AUROC: {val_auroc*100:.2f}%")
+                            
+                            # 4. 更新王座：存下当前表现最好的 Layer 及其物理向量！
+                            if val_auroc > best_val_auroc:
+                                best_val_auroc = val_auroc
+                                best_layer = current_layer
+                                best_trained_vector = trained_vec.clone()
+                                best_centroids = centroids.clone()
+                        
+                        # 阅后即焚
+                        if os.path.exists(temp_val_tsv): os.remove(temp_val_tsv)
+                            
+                    print(f"🏆 [Sweep 结束] 选出最强插件: 第 {best_layer} 层 (Val AUROC: {best_val_auroc*100:.2f}%)")
+                    
+                    # === Phase B: Test 终极拔插推理 ===
+                    print(f"\n[*] 正在将 Layer {best_layer} 的最强插件插入模型，对 Test 集进行终极推理...")
+                    
+                    # ⚠️ 拔插：直接把选出来的最佳插件应用到 test 集上，生成大管家能读的 tsv_path
+                    tsv_extractor.evaluate_vector(
+                        eval_jsonl_path=test_meta_path, 
+                        output_jsonl_path=tsv_path, 
+                        trained_vector=best_trained_vector, 
+                        final_centroids=best_centroids, 
+                        str_layer=best_layer
                     )
                     
-                    # 🚀 执行训练与全量打分 (input 锁定为你的 base_meta_path，即 03 文件)
-                    tsv_extractor.process_and_extract(
-                        input_jsonl_path=base_meta_path,
-                        output_jsonl_path=tsv_path,
-                        str_layer=9,
-                        num_train_samples=500
-                    )
-                    
-                    # 释放提取器引用，但模型依然留在显存供后续使用（直到下面清空）
                     del tsv_extractor
                     torch.cuda.empty_cache()
                 else:
                     print(f"[+] 检测到 TSV 专属特征已存在，跳过提取过程。")
 
+                    
             if sdpa_model is not None:
                 del sdpa_model, sdpa_tokenizer
                 gc.collect()
@@ -459,14 +520,14 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
 if __name__ == "__main__":
     set_global_seed(42)
     run_benchmark(
-        target_models=["meta-llama/Llama-3.2-3B-Instruct"],
+        target_models=["Qwen/Qwen3-14B"],
         datasets=["belebele"],
         baselines=[
             "selfcheck_bertscore",
             "selfcheck_nli",
             "semantic_entropy",
             "lexical_similarity",
-             "verbalize",
+            "verbalize",
             "self_evaluator",
             "perplexity",
             "ln_entropy",
