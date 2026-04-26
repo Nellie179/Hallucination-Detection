@@ -47,6 +47,24 @@ class LlamaDecoderLayerWrapper(nn.Module):
             hidden_states = self.tsv_layer(hidden_states)
             return hidden_states
 
+    # =========================================================
+    # 🚀 顶会级基建：防死锁动态属性透传 (Robust Dynamic Proxy)
+    # =========================================================
+    def __getattr__(self, name):
+        # 1. 优先让 PyTorch 原生机制查找 (parameters, buffers, registered modules)
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            pass
+            
+        # 2. 防御无限递归死锁：必须确保底座已经安全注册在内部 _modules 字典中，再进行透传
+        if 'llama_decoder_layer' in self._modules:
+            return getattr(self.llama_decoder_layer, name)
+            
+        # 3. 兜底防御：如果到底都没有，抛出标准错误，绝不乱吞异常
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
+
 def get_nested_attr(obj, attr_path):
     attrs = attr_path.split(".")
     for attr in attrs:

@@ -60,6 +60,7 @@ class TSVFeatureExtractor:
     def train_vector(self, train_jsonl_path, str_layer, epochs=20, batch_size=8, lr=0.005, lam=5.0):
         """
         🚀 纯训练函数：只在 Train 集上训练，返回训练好的参数，不产生评测文件。
+        (极致省显存版：切断全局梯度建图)
         """
         train_p, train_l, _ = self._prepare_data_simple(train_jsonl_path)
         
@@ -84,13 +85,27 @@ class TSVFeatureExtractor:
 
         self.model.eval()
         
-        def force_grad_hook(module, inp, out): out.requires_grad_(True)
-        emb_hook = self.model.get_input_embeddings().register_forward_hook(force_grad_hook)
-
+        # =========================================================
+        # 🚀 钩子：窃听器与梯度物理断电闸门
+        # 移除了致命的 emb_hook，不再强迫大模型全局通电建图
+        # =========================================================
         tracked_hiddens = []
-        def intercept_hook(module, input, output): tracked_hiddens.append(output)
+        def intercept_hook(module, input, output): 
+            hidden = output[0] if isinstance(output, tuple) else output
+            
+            # 1. 抓取真实带梯度的张量存进口袋
+            tracked_hiddens.append(hidden)
+            
+            # 2. 🚀 关键修改：将流向后续层的张量强行 detach，后续所有层变成纯推理，暴省 80% 显存
+            detached_hidden = hidden.detach()
+            
+            if isinstance(output, tuple):
+                return (detached_hidden,) + output[1:]
+            return detached_hidden
+            
         layers = get_layers(self.model)
-        hook_handle = layers[str_layer].tsv_layer.register_forward_hook(intercept_hook)
+        # 注意这里直接挂载在 layers[str_layer] 上
+        hook_handle = layers[str_layer].register_forward_hook(intercept_hook)
 
         with torch.enable_grad():
             for epoch in range(epochs):
@@ -107,6 +122,7 @@ class TSVFeatureExtractor:
                     tracked_hiddens.clear()
                     _ = self.model(b_in, output_hidden_states=False)
                     
+                    # 🚀 从口袋里拿出真正带梯度的截断层张量算 Loss
                     target_hidden = tracked_hiddens[0]
                     attn_mask = (b_in != self.tokenizer.pad_token_id).to(target_hidden.device)
                     last_token_rep = get_last_non_padded_token_rep(target_hidden, attn_mask).to(torch.float32)
@@ -124,7 +140,6 @@ class TSVFeatureExtractor:
                         centroids = update_centroids_ema_hard(centroids, last_token_rep.to(self.device), b_labels_oh.to(self.device), args)
                     pbar.set_postfix({"loss": f"{ot_loss.item():.4f}"})
 
-        emb_hook.remove()
         hook_handle.remove()
         
         # 🚀 提取训练好的物理张量
