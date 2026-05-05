@@ -145,12 +145,44 @@ class QAHiddenStateExtractor:
             seq_len = full_ids.shape[1]
         
         else:
-            p_ids = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=True).to(self.device)
+            # p_ids = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=True).to(self.device)
+            # a_ids = self.tokenizer(answer, return_tensors="pt", add_special_tokens=False).to(self.device)
+            # prompt_len = p_ids.input_ids.shape[1]
+            # full_ids = torch.cat([p_ids.input_ids, a_ids.input_ids], dim=-1)
+            # full_mask = torch.cat([p_ids.attention_mask, a_ids.attention_mask], dim=-1)
+            # seq_len = full_ids.shape[1] 
+
+
+            # 🚀 [终极妥协版]：绝对优先保留 Answer，从 Prompt 头部（左侧）截断
+            MAX_SEQ_LEN = 256 
+            
+            # 第一步：先毫无保留地 Tokenize Answer，确认它到底有多长
             a_ids = self.tokenizer(answer, return_tensors="pt", add_special_tokens=False).to(self.device)
-            prompt_len = p_ids.input_ids.shape[1]
+            ans_len = a_ids.input_ids.shape[1]
+            
+            # 🚨 物理极限防呆：如果 Answer 自己就已经长到能撑爆显存了（极少数情况）
+            # 那没办法，只能给它强行卡在 MAX_SEQ_LEN - 16，给 Prompt 留最后 16 个 Token 的底线
+            if ans_len >= MAX_SEQ_LEN - 16:
+                a_ids = self.tokenizer(answer, return_tensors="pt", add_special_tokens=False, truncation=True, max_length=MAX_SEQ_LEN - 16).to(self.device)
+                ans_len = a_ids.input_ids.shape[1]
+                
+            # 第二步：计算留给 Prompt 的剩余生存空间
+            remaining_len = MAX_SEQ_LEN - ans_len
+            
+            # 第三步：严格截断 Prompt！
+            # 💡 关键操作：临时将截断方向改为 'left'，确保截掉前面冗长的参考文档，保留紧贴着 Answer 的最后那句“问题”
+            original_truncation_side = self.tokenizer.truncation_side
+            self.tokenizer.truncation_side = 'left'
+            
+            p_ids = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=True, truncation=True, max_length=remaining_len).to(self.device)
+            
+            # 恢复 Tokenizer 原本的设定，防止影响后续流程
+            self.tokenizer.truncation_side = original_truncation_side
+            
+            # 第四步：物理拼接
             full_ids = torch.cat([p_ids.input_ids, a_ids.input_ids], dim=-1)
             full_mask = torch.cat([p_ids.attention_mask, a_ids.attention_mask], dim=-1)
-            seq_len = full_ids.shape[1] 
+            seq_len = full_ids.shape[1]
         
         need_attn = (method == "icr_probe")
         with torch.no_grad():
@@ -158,7 +190,8 @@ class QAHiddenStateExtractor:
                 input_ids=full_ids, 
                 attention_mask=full_mask,
                 output_hidden_states=True, 
-                output_attentions=need_attn
+                output_attentions=need_attn,
+                use_cache=False
             )
             logits = outputs.logits
 
@@ -458,29 +491,65 @@ class QAHiddenStateExtractor:
         extract_all_layers: bool = True
     ) -> Dict[str, Any]:
         
+        # 🚀 [核心修改 1]：动态安全限长。Eager模式对长度极度敏感，限制在 1536；SDPA 模式放宽至 2048。
+        # 绝对不要用 256，否则 XSum 的原文档会被全部截断，导致评测失效。
+        MAX_SEQ_LEN = 1536 if method == "icr_probe" else 2048
+        
         if method == "prism":
             statement = f"{prompt}\n{answer}".strip()
             prism_prompt = f"Does the statement '{statement}' accurately reflect the truth?"
             
-            full_ids = self.tokenizer(prism_prompt, return_tensors="pt", add_special_tokens=True).to(self.device).input_ids
-            full_mask = self.tokenizer(prism_prompt, return_tensors="pt", add_special_tokens=True).to(self.device).attention_mask
+            # 🚀 [核心修改 2]：对 prism 分支补充从左侧的防 OOM 截断
+            original_side = self.tokenizer.truncation_side
+            self.tokenizer.truncation_side = 'left'
+            inputs = self.tokenizer(prism_prompt, return_tensors="pt", add_special_tokens=True, truncation=True, max_length=MAX_SEQ_LEN).to(self.device)
+            self.tokenizer.truncation_side = original_side
+            
+            full_ids = inputs.input_ids
+            full_mask = inputs.attention_mask
             prompt_len = full_ids.shape[1] 
             seq_len = full_ids.shape[1]
         
         elif method == "self_evaluator":
             target_prompt = f"Question: {prompt}\nProposed Answer: {answer}\nIs the proposed answer True or False?\nAnswer:"
-            full_ids = self.tokenizer(target_prompt, return_tensors="pt", add_special_tokens=True).to(self.device).input_ids
-            full_mask = self.tokenizer(target_prompt, return_tensors="pt", add_special_tokens=True).to(self.device).attention_mask
+            
+            # 🚀 [核心修改 3]：对 self_evaluator 分支补充防 OOM 截断
+            original_side = self.tokenizer.truncation_side
+            self.tokenizer.truncation_side = 'left'
+            inputs = self.tokenizer(target_prompt, return_tensors="pt", add_special_tokens=True, truncation=True, max_length=MAX_SEQ_LEN).to(self.device)
+            self.tokenizer.truncation_side = original_side
+            
+            full_ids = inputs.input_ids
+            full_mask = inputs.attention_mask
             prompt_len = full_ids.shape[1]
             seq_len = full_ids.shape[1]
         
         else:
-            p_ids = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=True).to(self.device)
+            # 第一步：先毫无保留地 Tokenize Answer，确认长度
             a_ids = self.tokenizer(answer, return_tensors="pt", add_special_tokens=False).to(self.device)
-            prompt_len = p_ids.input_ids.shape[1]
+            ans_len = a_ids.input_ids.shape[1]
+            
+            # 物理极限防呆：给 Prompt 留至少 32 个 Token 的底线
+            if ans_len >= MAX_SEQ_LEN - 32:
+                a_ids = self.tokenizer(answer, return_tensors="pt", add_special_tokens=False, truncation=True, max_length=MAX_SEQ_LEN - 32).to(self.device)
+                ans_len = a_ids.input_ids.shape[1]
+                
+            # 第二步：计算留给 Prompt 的剩余生存空间
+            remaining_len = MAX_SEQ_LEN - ans_len
+            
+            # 第三步：严格从左侧截断 Prompt，保留最靠近 Answer 的部分
+            original_side = self.tokenizer.truncation_side
+            self.tokenizer.truncation_side = 'left'
+            p_ids = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=True, truncation=True, max_length=remaining_len).to(self.device)
+            self.tokenizer.truncation_side = original_side
+            
+            # 第四步：物理拼接
             full_ids = torch.cat([p_ids.input_ids, a_ids.input_ids], dim=-1)
             full_mask = torch.cat([p_ids.attention_mask, a_ids.attention_mask], dim=-1)
-            seq_len = full_ids.shape[1] 
+            
+            # 🚀 [核心修改 4]：必须重新计算并赋值 prompt_len，否则后续索引 logprobs 会报 UnboundLocalError
+            prompt_len = p_ids.input_ids.shape[1]
+            seq_len = full_ids.shape[1]
         
         need_attn = (method == "icr_probe")
         with torch.no_grad():
@@ -488,7 +557,8 @@ class QAHiddenStateExtractor:
                 input_ids=full_ids, 
                 attention_mask=full_mask,
                 output_hidden_states=True, 
-                output_attentions=need_attn
+                output_attentions=need_attn,
+                use_cache=False
             )
             logits = outputs.logits
 
