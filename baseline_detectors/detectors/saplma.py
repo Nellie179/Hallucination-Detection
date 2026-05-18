@@ -1,9 +1,3 @@
-# baseline_detectors/detectors/saplma.py
-"""
-SAPLMA (The Internal State of an LLM Knows When It's Lying)
-利用多层感知机 (MLP) 对大模型回答时的隐藏层特征进行二分类有监督训练。
-"""
-
 import numpy as np
 import logging
 from typing import List
@@ -13,6 +7,7 @@ import os
 try:
     from sklearn.neural_network import MLPClassifier
     from sklearn.preprocessing import StandardScaler
+
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
@@ -25,45 +20,43 @@ from data_utils.accessor import SampleAccessor
 
 logger = logging.getLogger(__name__)
 
+
 @register_detector("saplma")
 class SAPLMADetector(BaseDetector):
     def __init__(
-        self,
-        name: str = "saplma",
-        target_layer: int = -1,  # 默认取最后一层
-        **kwargs
+            self,
+            name: str = "saplma",
+            target_layer: int = -1,
+            **kwargs
     ):
         super().__init__(name, **kwargs)
         if not SKLEARN_AVAILABLE:
-            raise RuntimeError("SAPLMA 需要 scikit-learn 支持")
+            raise RuntimeError("SAPLMA requires scikit-learn support")
 
         self.requires_qa_features = True
         self.target_layer = target_layer
-        
-        # 🎯 SAPLMA 核心：多层感知机 (隐藏层维度 256 -> 128)
+
         self.scaler = StandardScaler()
         self.mlp = MLPClassifier(
             hidden_layer_sizes=(256, 128),
             max_iter=1000,
-            early_stopping=True,  # 防止过拟合
+            early_stopping=True,
             random_state=42
         )
         self.is_fitted = False
 
-        logger.info(f"[{self.name}] SAPLMA (MLP) 探测器初始化完成")
+        logger.info(f"[{self.name}] SAPLMA (MLP) detector initialization complete")
 
     def _extract_hidden_state(self, accessor: SampleAccessor) -> np.ndarray:
-        """读取大管家挂载过来的 base_logit_recovery 文件中的特征"""
         if not accessor.qa_h5_file:
-            raise ValueError(f"样本 {accessor.sample_id} 缺少 QA 特征！")
-            
-        # 💡 极其聪明的白嫖：寻找 base_logit_recovery 的组
+            raise ValueError(f"Sample {accessor.sample_id} is missing QA features!")
+
         grp_name = f"{accessor.sample_id}_base_logit_recovery"
         if grp_name not in accessor.qa_h5_file:
-            raise KeyError(f"H5 中缺失样本 {accessor.sample_id} 的 base_logit_recovery 组，白嫖失败！")
-            
+            raise KeyError(f"base_logit_recovery group for sample {accessor.sample_id} is missing in H5 file.")
+
         grp = accessor.qa_h5_file[grp_name]
-        
+
         layer_str = f"layer_{self.target_layer}"
         if self.target_layer < 0:
             layers = [int(k.split("_")[1]) for k in grp.keys() if k.startswith("layer_")]
@@ -73,7 +66,7 @@ class SAPLMADetector(BaseDetector):
         return feat
 
     def fit(self, train_accessors: List[SampleAccessor]) -> None:
-        logger.info(f"[{self.name}] 开始训练 SAPLMA MLP网络...")
+        logger.info(f"[{self.name}] Starting SAPLMA MLP network training...")
         X_list, y_list = [], []
 
         for accessor in train_accessors:
@@ -85,11 +78,12 @@ class SAPLMADetector(BaseDetector):
                 X_list.append(feat)
                 y_list.append(1 if category == "hallucination" else 0)
             except Exception as e:
-                logger.debug(f"跳过样本 {accessor.sample_id}: {e}")
+                logger.debug(f"Skipping sample {accessor.sample_id}: {e}")
                 continue
 
         if len(set(y_list)) < 2:
-            logger.warning(f"[{self.name}] 训练集必须包含正负样本，跳过训练。")
+            logger.warning(
+                f"[{self.name}] Training set must contain both positive and negative samples, skipping training.")
             return
 
         X = np.array(X_list, dtype=np.float32)
@@ -98,8 +92,8 @@ class SAPLMADetector(BaseDetector):
         X_scaled = self.scaler.fit_transform(X)
         self.mlp.fit(X_scaled, y)
         self.is_fitted = True
-        
-        logger.info(f"[{self.name}] 训练完成！(拟合准确率: {self.mlp.score(X_scaled, y)*100:.2f}%)")
+
+        logger.info(f"[{self.name}] Training complete! (Fitting accuracy: {self.mlp.score(X_scaled, y) * 100:.2f}%)")
 
     def predict_score(self, accessor: SampleAccessor) -> float:
         if not self.is_fitted: return float('nan')
