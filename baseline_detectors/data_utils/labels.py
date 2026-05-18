@@ -1,11 +1,6 @@
 import json
 
-
 def load_labels(label_jsonl_path: str, label_mapping: dict):
-    """
-    Returns:
-        label_dict: {sample_id: int_label}
-    """
     label_dict = {}
 
     with open(label_jsonl_path, "r", encoding="utf-8") as f:
