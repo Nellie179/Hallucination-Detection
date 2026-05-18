@@ -60,10 +60,10 @@ nvidia-nvjitlink==13.0.88
 nvidia-nvshmem-cu13==3.4.5
 nvidia-nvtx==13.0.85
 openai==2.26.0
-packaging @ file:///home/task_176104874243446/conda-bld/packaging_1761049080023/work
+packaging==24.2
 pandas==3.0.1
 pillow==12.0.0
-pip @ file:///home/task_177071101768311/croot/pip_1770711076895/work
+pip==24.0
 propcache==0.4.1
 psutil==7.2.2
 pyarrow==23.0.1
@@ -80,6 +80,7 @@ rich==14.3.3
 safetensors==0.7.0
 scikit-learn==1.8.0
 scipy==1.17.1
+sentence-transformers>=3.0.0
 setuptools==80.10.2
 shellingham==1.5.4
 six==1.17.0
@@ -92,7 +93,7 @@ torch-c-dlpack-ext==0.1.5
 torchdiffeq==0.2.5
 torchvision==0.25.0+cu130
 tqdm==4.67.3
-transformers @ git+https://github.com/huggingface/transformers.git@cda09a00721968a9b2eb036574e6f6c1e8d04b7a
+transformers==4.45.0
 triton==3.6.0
 typer==0.24.1
 typing-extensions==4.15.0
