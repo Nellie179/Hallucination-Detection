@@ -10,10 +10,10 @@ import numpy as np
 from prompt_builder import LLMPromptBuilder
 
 
-def hdf5_writer_process_worker(data_queue, h5_filepath, jsonl_filepath):
-    print(f"[Writer Process] Started (PID: {os.getpid()}). Dedicated to I/O.")
+def hdf5_writer_process_worker(data_queue, f_h5_path, jsonl_filepath):
+    print(f"[Writer Process] Started (PID: {os.getpid()}). Dedicated to I/O processing.")
     with open(jsonl_filepath, 'a', encoding='utf-8') as f_json, \
-            h5py.File(h5_filepath, 'a') as f_h5:
+            h5py.File(f_h5_path, 'a') as f_h5:
 
         while True:
             item = data_queue.get()
@@ -44,9 +44,9 @@ def hdf5_writer_process_worker(data_queue, h5_filepath, jsonl_filepath):
                 f_json.flush()
                 f_h5.flush()
             except Exception as e:
-                print(f"[Writer Process] Error saving {sample_id}: {e}")
+                print(f"[Writer Process] Exception encountered while serializing sample {sample_id}: {e}")
 
-    print(f"[Writer Process] Finished and safely closed all file handles.")
+    print(f"[Writer Process] Finished execution and closed all active file descriptors safely.")
 
 
 class HiddenStateExtractor:
@@ -60,9 +60,9 @@ class HiddenStateExtractor:
         self.device = device if device else ("cuda" if torch.cuda.is_available() else "cpu")
         self.model_name = model_name
         self.model_kwargs = model_kwargs or {}
-        print(f"[*] 正在使用原生 Transformers 加载模型 {model_name} 到 {self.device}...")
+        print(f"[*] Initializing model {model_name} onto target compute hardware device: {self.device}...")
         if self.model_kwargs:
-            print(f"    - 透传加载参数: {self.model_kwargs}")
+            print(f"    - Forwarding initialization parameters: {self.model_kwargs}")
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, **self.model_kwargs)
         if self.tokenizer.pad_token is None:
@@ -77,7 +77,7 @@ class HiddenStateExtractor:
         self.model.eval()
 
         self.total_layers = self.model.config.num_hidden_layers
-        print(f"[+] 模型加载完成，总层数: {self.total_layers}")
+        print(f"[+] Model initialization loop finished. Total structural hidden layers detected: {self.total_layers}")
 
     def _resolve_target_layers(self, layer_config):
         if not layer_config:
@@ -92,7 +92,7 @@ class HiddenStateExtractor:
             start_idx = (self.total_layers // 2) - (count // 2)
             return list(range(start_idx, start_idx + count))
         else:
-            raise ValueError(f"Unsupported layer config: {layer_config}")
+            raise ValueError(f"Unsupported layer config schema declaration: {layer_config}")
 
     def _resolve_target_tokens(self, total_generated, token_config):
         if not token_config:
@@ -109,7 +109,7 @@ class HiddenStateExtractor:
             start = max(0, total_generated - count)
             return list(range(start, total_generated))
         else:
-            raise ValueError(f"Unsupported token config: {token_config}")
+            raise ValueError(f"Unsupported sequence token slicing configuration: {token_config}")
 
     def generate_and_extract(self, prompt, layer_config, token_config, max_new_tokens, generation_kwargs=None):
         target_layers = self._resolve_target_layers(layer_config)
@@ -190,7 +190,7 @@ class HiddenStateExtractor:
         tpl_kwargs = template_kwargs or {}
 
         if not os.path.exists(input_jsonl_path):
-            raise FileNotFoundError(f"Input file not found: {input_jsonl_path}")
+            raise FileNotFoundError(f"Target input file location absent: {input_jsonl_path}")
 
         os.makedirs(os.path.dirname(output_h5_path) or ".", exist_ok=True)
         os.makedirs(os.path.dirname(output_jsonl_path) or ".", exist_ok=True)
@@ -214,7 +214,7 @@ class HiddenStateExtractor:
         writer_process.daemon = True
         writer_process.start()
 
-        print("[*] 正在加载数据池并初始化 Prompt 渲染引擎...")
+        print("[*] Loading configuration data pools and generating template serialization workflows...")
         prompt_builder = LLMPromptBuilder(
             model_name=self.model_name,
             global_system_prompt=system_prompt,
@@ -232,7 +232,7 @@ class HiddenStateExtractor:
         try:
             for item in dataset_items:
                 sample_id = item["sample_id"]
-                print(f"[Main Process] Inferencing {sample_id}...")
+                print(f"[Main Process] Executing downstream pipeline inference target sequence: {sample_id}...")
 
                 prompt_str = prompt_builder.build_prompt(target_item=item, few_shot_pool=dataset_items)
                 item["prompt"] = prompt_str
@@ -259,26 +259,22 @@ class HiddenStateExtractor:
                 processed_count += 1
 
         except KeyboardInterrupt:
-            print("\n[!] 🛑 接收到打断信号 (Ctrl+C)！正在紧急执行安全收尾...")
-            print("[!] 强行中断可能导致本次特征提取不完整，但正在全力保护已落盘的数据。")
+            print("\n[!] 🛑 Interruption trace captured (Ctrl+C). Engaging safe extraction routine abort...")
+            print("[!] Terminating current pipeline processing sequence. Activating preservation locks for existing disk cache...")
 
         finally:
-            print(f"[*] 等待 I/O 进程保存并关闭 HDF5 文件 (至关重要)...")
+            print(f"[*] Awaiting background I/O process synchronization lock and HDF5 file closing handles...")
             data_queue.put(None)
             writer_process.join(timeout=10)
 
             if writer_process.is_alive():
-                print("[!] ⚠️ I/O 进程未能按时退出，执行强制终止！")
+                print("[!] ⚠️ Background I/O writer worker exceeded standard graceful termination timeout limit. Executing forced process kill.")
                 writer_process.terminate()
 
-            print(f"[+] 提取流水线已安全退出！本次成功提取 {processed_count} 条。")
+            print(f"[+] Activation state tracking pipeline closed cleanly. Serialized {processed_count} unique sequence rows successfully.")
 
 
-# ==========================================
-# 本地组件验证测试 (TEST沙盒隔离 + Few-shot抗压版)
-# ==========================================
 if __name__ == "__main__":
-    # 【核心新增】：所有测试产物圈禁在专门的 TEST 目录中
     TEST_DIR = "./TEST"
     os.makedirs(TEST_DIR, exist_ok=True)
 
@@ -286,7 +282,6 @@ if __name__ == "__main__":
     test_output_h5 = os.path.join(TEST_DIR, "output_tensors_test.h5")
     test_output_jsonl = os.path.join(TEST_DIR, "output_metadata_test.jsonl")
 
-    # 构造题库池，必须超过我们设置的 num_shots 数量，才能测试出随机抽样的魅力
     mock_dataset = [
         {"sample_id": "test_qa_001", "structured_data": {"task_type": "qa", "system_instruction": "", "context": "",
                                                          "question": "Capital of France?", "choices": {},
@@ -306,14 +301,13 @@ if __name__ == "__main__":
                              "ground_truths": ["get_weather('NYC')"], "incorrect_answers": []}, "original_doc": {}}
     ]
 
-    print(f"[*] 生成符合 Universal Schema 的极限测试数据，并隔离至 {TEST_DIR}/ ...")
+    print(f"[*] Formatting universal validation structures into diagnostic cache under: {TEST_DIR}/ ...")
     with open(test_input_file, "w", encoding="utf-8") as f:
         for item in mock_dataset:
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
-    print("[*] 开始原生 Transformers 模块全链路抗压测试...")
+    print("[*] Commencing baseline stress test loops for underlying text processing models...")
 
-    # 极限透传参数测试 (确保字典正确穿越)
     test_model_kwargs = {"trust_remote_code": True}
     test_gen_kwargs = {"do_sample": False}
     test_template_kwargs = {}
@@ -328,13 +322,12 @@ if __name__ == "__main__":
         output_h5_path=test_output_h5,
         output_jsonl_path=test_output_jsonl,
         layer_config={"mode": "middle", "count": 2},
-        # 测试极端 Token 提取：提取倒数 10 个 (看是否会触发 out of index 保护)
         token_config={"mode": "backward", "count": 10},
-        max_new_tokens=20,  # 故意设短看截断表现
+        max_new_tokens=20,
         system_prompt="You are undergoing an extreme stress test.",
-        num_shots=2,  # 【核心测试】：强行开启 2-shot 并在大文本下验证张量聚合
+        num_shots=2,
         generation_kwargs=test_gen_kwargs,
         template_kwargs=test_template_kwargs
     )
 
-    print(f"\n[+] ✅ 单元测试全部通过！所有测试产物(含 JSONL, H5) 已被干净地收纳在 {TEST_DIR} 目录中，快去验收吧！")
+    print(f"\n[+] ✅ Functional unit validation trace completed successfully. Computational outputs preserved inside isolated testing track directory: {TEST_DIR}")

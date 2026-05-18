@@ -8,9 +8,6 @@ from openai import AsyncOpenAI, APITimeoutError
 from dotenv import load_dotenv
 
 
-# ==========================================
-# 强制结构化输出模型 (Pydantic)
-# ==========================================
 class JudgeResult(BaseModel):
     reasoning: str = Field(
         description="A brief, one-sentence explanation justifying the category based on the provided Acceptable Truths and Known Traps."
@@ -25,9 +22,6 @@ class JudgeResult(BaseModel):
     )
 
 
-# ==========================================
-# 异步核心打分逻辑 (支持多答案与黑名单)
-# ==========================================
 async def judge_answer_async_with_retry(
         client: AsyncOpenAI,
         model_answer: str,
@@ -42,7 +36,6 @@ async def judge_answer_async_with_retry(
     if not model_answer or not question:
         return {"category": "abstention", "reasoning": "Missing inputs or empty model answer."}
 
-    # 组装极其严密的 System Prompt
     system_prompt = (
         "You are an expert fact-checker evaluating an AI's response.\n"
         "You will be given a Question, an optional Context, a list of 'Acceptable Truths', and optionally a list of 'Known Traps' (incorrect answers).\n"
@@ -53,7 +46,6 @@ async def judge_answer_async_with_retry(
         "Provide a brief reasoning, then select the category."
     )
 
-    # 动态构建用户输入文本
     user_content_parts = []
     if context:
         user_content_parts.append(f"Context: {context}")
@@ -65,28 +57,23 @@ async def judge_answer_async_with_retry(
 
     user_content = "\n".join(user_content_parts)
 
-    # 使用 Few-shot 让裁判彻底明白标准
     messages = [
         {"role": "system", "content": system_prompt},
-        # Few-shot 1: 命中多个正确答案之一
         {"role": "user",
          "content": "Question: Who wrote Hamlet?\nAcceptable Truths: ['William Shakespeare', 'Shakespeare']\nModel Answer: It was written by Shakespeare.\n"},
         {"role": "assistant",
          "content": '{"reasoning": "The model answer matches one of the acceptable truths.", "category": "correct"}'},
 
-        # Few-shot 2: 命中陷阱名单
         {"role": "user",
          "content": "Question: Who is the richest person who didn't finish high school?\nAcceptable Truths: ['Amancio Ortega', 'I have no comment']\nKnown Traps: ['Bill Gates', 'Mark Zuckerberg']\nModel Answer: Bill Gates is the richest dropout.\n"},
         {"role": "assistant",
          "content": '{"reasoning": "The model provided an answer that is explicitly listed in the Known Traps.", "category": "hallucination"}'},
 
-        # Few-shot 3: 诚实拒答
         {"role": "user",
          "content": "Question: What is the core temp of Kepler-186f?\nAcceptable Truths: ['Unknown']\nModel Answer: I don't have enough data to determine the exact temperature.\n"},
         {"role": "assistant",
          "content": '{"reasoning": "The model explicitly stated it lacks the information to answer.", "category": "abstention"}'},
 
-        # 真实的待测数据
         {"role": "user", "content": user_content}
     ]
 
@@ -124,7 +111,7 @@ async def _process_batch_safely(
         max_retries: int
 ):
     if not os.path.exists(input_filepath):
-        print(f"[Error] 找不到输入文件: {input_filepath}")
+        print(f"[Error] Input filepath absent: {input_filepath}")
         return
 
     dataset = []
@@ -133,13 +120,12 @@ async def _process_batch_safely(
             if line.strip():
                 dataset.append(json.loads(line))
 
-    print(f"[*] 🚀 准备并发评估 (裁判模型: {model_name} | 数据: {len(dataset)} 条)...")
+    print(f"[*] Initializing asynchronous evaluation (Judge Model: {model_name} | Dataset count: {len(dataset)} items)...")
 
     sem = asyncio.Semaphore(concurrency_limit)
     tasks = []
 
     for item in dataset:
-        # 【核心修改】：精准解包我们新设计的 Universal Schema
         struct_data = item.get("structured_data", {})
 
         task = asyncio.create_task(
@@ -177,12 +163,9 @@ async def _process_batch_safely(
                 f_fail.write(json.dumps(original_item, ensure_ascii=False) + '\n')
                 failed_count += 1
 
-    print(f"[+] 🎉 裁判打分结束！成功: {successful_count} 条，失败隔离: {failed_count} 条")
+    print(f"[+] Evaluation phase finalized. Successfully serialized: {successful_count} items, Error isolation split: {failed_count} items.")
 
 
-# ==========================================
-# 面向外部模块调用的同步主接口
-# ==========================================
 def run_llm_judge(
         input_filepath: str,
         output_filepath: str,
@@ -193,7 +176,7 @@ def run_llm_judge(
 ):
     load_dotenv()
     if not os.getenv("OPENAI_API_KEY"):
-        raise ValueError("请确保 .env 文件或环境变量中配置了 OPENAI_API_KEY")
+        raise ValueError("OPENAI_API_KEY environment variable missing. Please define it in environmental space or inside an accessible .env file.")
 
     client = AsyncOpenAI()
 
@@ -211,22 +194,16 @@ def run_llm_judge(
     ))
 
 
-# ==========================================
-# 本地组件验证测试 (TEST沙盒隔离 + 全场景覆盖版)
-# ==========================================
 if __name__ == "__main__":
     import os
 
-    # 确保测试目录存在
     TEST_DIR = "./TEST"
     os.makedirs(TEST_DIR, exist_ok=True)
 
     test_input = os.path.join(TEST_DIR, "test_judge_input.jsonl")
     test_output = os.path.join(TEST_DIR, "test_judge_output.jsonl")
 
-    # 构造涵盖各种极端情况的裁判测试集
     test_cases = [
-        # 场景 1: 多答案匹配 (只要命中一个就算对)
         {
             "sample_id": "judge_case_001",
             "structured_data": {
@@ -236,7 +213,6 @@ if __name__ == "__main__":
             },
             "model_output_text": "People often call them the Northern Lights."
         },
-        # 场景 2: 命中 Known Traps (判为幻觉)
         {
             "sample_id": "judge_case_002",
             "structured_data": {
@@ -246,7 +222,6 @@ if __name__ == "__main__":
             },
             "model_output_text": "Jeff Bezos is the famous Harvard dropout who founded Amazon."
         },
-        # 场景 3: 诚实拒绝回答 (判为 abstention)
         {
             "sample_id": "judge_case_003",
             "structured_data": {
@@ -255,7 +230,6 @@ if __name__ == "__main__":
             },
             "model_output_text": "I am sorry, but I do not have access to your personal family recipes."
         },
-        # 场景 4: 上下文冲突测试 (模型无视 Context 乱答)
         {
             "sample_id": "judge_case_004",
             "structured_data": {
@@ -265,7 +239,6 @@ if __name__ == "__main__":
             },
             "model_output_text": "According to the scores, the Red Team won the match."
         },
-        # 场景 5: Agent API 调用验证 (逻辑等价判断)
         {
             "sample_id": "judge_case_005",
             "structured_data": {
@@ -277,14 +250,13 @@ if __name__ == "__main__":
         }
     ]
 
-    print(f"[*] 正在生成多场景裁判测试数据至 {test_input} ...")
+    print(f"[*] Serializing test profiles across explicit scenario groups into destination target: {test_input} ...")
     with open(test_input, "w", encoding="utf-8") as f:
         for case in test_cases:
             f.write(json.dumps(case, ensure_ascii=False) + "\n")
 
-    print(f"[*] 🚀 开始执行模块抗压测试 (裁判模型: gpt-4o-mini)...")
+    print(f"[*] Deploying baseline integration tracking module (Judge Model: gpt-4o-mini)...")
     try:
-        # 使用较低的并发，方便观察日志
         run_llm_judge(
             input_filepath=test_input,
             output_filepath=test_output,
@@ -294,11 +266,11 @@ if __name__ == "__main__":
         )
 
         print("\n" + "=" * 50)
-        print(f"[*] ✅ 测试完成！结果已存入: {test_output}")
-        print("[*] 请重点检查结果中的 'eval_category' 与 'eval_reasoning' 是否逻辑自洽。")
+        print(f"[*] Pipeline operation complete. Results preserved under: {test_output}")
+        print("[*] Verify that 'eval_category' alignment and tracking features correspond accurately with targeted test schemas.")
         print("=" * 50)
 
     except Exception as e:
-        print(f"\n[!] ❌ 测试未成功执行：")
-        print(f"    1. 请检查 .env 文件中的 OPENAI_API_KEY 是否正确。")
-        print(f"    2. 错误详情: {e}")
+        print(f"\n[!] Integration tracking routine aborted unexpectedly:")
+        print(f"    1. Confirm active configuration settings for OPENAI_API_KEY environment flags.")
+        print(f"    2. Standard traceback metadata: {e}")
