@@ -1,7 +1,7 @@
 # OpenHalDet: A Unified Benchmark for Hallucination Detection across Diverse Generation Scenarios
 
 <p align="center">
-  <a href="https://arxiv.org/abs/submit/7678788"><img src="https://img.shields.io/badge/arXiv-2506.xxxxx-b31b1b.svg" alt="arXiv"></a>
+  <a href="https://arxiv.org/abs/2606.06959"><img src="https://img.shields.io/badge/arXiv-2606.06959-b31b1b.svg" alt="arXiv"></a>
   <a href="https://github.com/Nellie179/Hallucination-Detection"><img src="https://img.shields.io/badge/GitHub-Hallucination--Detection-blue?logo=github" alt="GitHub"></a>
   <img src="https://img.shields.io/badge/Python-3.9%2B-blue" alt="Python">
   <img src="https://img.shields.io/badge/PyTorch-2.x-orange" alt="PyTorch">
@@ -420,7 +420,7 @@ If you use OpenHalDet in your research, please cite:
   author    = {Li, Xinyi and Fang, Zhen and Deng, Yongxin and Luo, Jinyuan and Ma, Hongnan and
                Oh, Changdae and Shi, Zijing and Ye, Shanshan and Wang, Hanchen and Chen, Shu-Lin and
                Luo, Yadan and Yang, Mengyue and Du, Sean and Li, Sharon and Chen, Ling},
-  journal   = {arXiv preprint arXiv:submit/7678788},
+  journal   = {arXiv preprint arXiv:2606.06959},
   year      = {2026}
 }
 ```
