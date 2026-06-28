@@ -10,13 +10,7 @@ logger = logging.getLogger(__name__)
 class VerbalizeDetector(BaseDetector):
     def __init__(self, name="verbalize", **kwargs):
         super().__init__(name, **kwargs)
-        self.prompt_template = (
-            "Answer the following question and then provide a confidence score "
-            "between 0 and 1 representing how sure you are about your answer.\n"
-            "Question: {question}\n"
-            "Answer: {answer}\n"
-            "Confidence Score (0-1):"
-        )
+        # Actual prompt is defined in generate_auxiliary_evals.py
 
     def _extract_confidence(self, text: str) -> float:
         if not text: return 0.5

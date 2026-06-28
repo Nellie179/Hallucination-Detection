@@ -51,11 +51,10 @@ class PRISMDataset(Dataset):
 
 @register_detector("prism")
 class PRISMDetector(BaseDetector):
-    def __init__(self, name: str, target_layer: int = -1, use_prompt_ensemble: bool = False, **kwargs):
+    def __init__(self, name: str, target_layer: int = -1, **kwargs):
         super().__init__(name, **kwargs)
         self.requires_qa_features = True
         self.target_layer = target_layer
-        self.use_prompt_ensemble = use_prompt_ensemble
 
         self.epochs = 10
         self.batch_size = 32
