@@ -69,7 +69,9 @@ class SARDetector(BaseDetector):
         return torch.tensor(weighted_entropy, device=self.device)
 
     def predict_score(self, accessor: SampleAccessor) -> float:
-        prompt = accessor.get_prompt_text()
+        question = accessor.metadata.get("structured_data", {}).get("question", "")
+        prefix = question[:200] if question else ""
+
         raw_samples = accessor.get_stochastic_samples()
         raw_logprobs = accessor.get_stochastic_logprobs()
 
@@ -92,8 +94,9 @@ class SARDetector(BaseDetector):
                 f"[SAR Critical Intercept] Sample {accessor.sample_id} has fewer than 2 valid generations and cannot be evaluated.")
             return 0.5
 
-        print(
-            f"[*] Sample {accessor.sample_id} data verification passed (Generations: {num_generations}), preparing tensor computations...")
+        logger.debug(
+            f"[{self.name}] Sample {accessor.sample_id} verified (generations: {num_generations}), computing similarities..."
+        )
 
         gen_entropies = torch.tensor([-lp for lp in logprobs], dtype=torch.float32, device=self.device)
 
@@ -101,7 +104,7 @@ class SARDetector(BaseDetector):
         pair_indices = []
         for i in range(num_generations):
             for j in range(i + 1, num_generations):
-                pairs.append([prompt + samples[i], prompt + samples[j]])
+                pairs.append([prefix + samples[i], prefix + samples[j]])
                 pair_indices.append((i, j))
 
         flat_similarities = self.measure_model.predict(pairs, show_progress_bar=False)
