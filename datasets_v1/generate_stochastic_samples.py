@@ -76,8 +76,7 @@ class StochasticExtractor(HiddenStateExtractor):
             else:
                 self.total_layers = self.model.config.text_config.num_hidden_layers
 
-            print(
-                f"[*] StochasticExtractor successfully initialized with injected model instance on device: {self.device}")
+            print(f"[*] StochasticExtractor successfully initialized with injected model instance on device: {self.device}")
         else:
             super().__init__(model_name, model_kwargs)
 
@@ -91,69 +90,82 @@ class StochasticExtractor(HiddenStateExtractor):
         attention_mask = inputs.attention_mask
         prompt_len = input_ids.shape[1]
 
-        batch_results = []
         safety_processors = LogitsProcessorList([MultinomialSafetyProcessor()])
 
+        # ── Step 1: Generate all K samples in one batched call ──────────────
+        # output_hidden_states=False: causal mask guarantees equivalence with
+        # a separate forward pass, so we extract hidden states there instead.
+        with torch.no_grad():
+            final_gen_kwargs = {
+                **gen_kwargs,
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "max_new_tokens": max_new_tokens,
+                "num_return_sequences": num_samples,
+                "return_dict_in_generate": True,
+                "output_hidden_states": False,
+                "output_scores": True,
+                "pad_token_id": self.tokenizer.pad_token_id,
+                "renormalize_logits": True,
+                "logits_processor": safety_processors
+            }
+            outputs = self.model.generate(**final_gen_kwargs)
+
+        # Compute transition scores for all K samples at once [K, gen_len]
+        transition_scores = None
+        if hasattr(outputs, "scores") and outputs.scores:
+            transition_scores = self.model.compute_transition_scores(
+                outputs.sequences, outputs.scores, normalize_logits=True
+            )
+
+        # ── Step 2: Per-sample hidden-state extraction via forward pass ──────
+        batch_results = []
         for i in range(num_samples):
-            with torch.no_grad():
-                final_gen_kwargs = {
-                    **gen_kwargs,
-                    "input_ids": input_ids,
-                    "attention_mask": attention_mask,
-                    "max_new_tokens": max_new_tokens,
-                    "num_return_sequences": 1,
-                    "return_dict_in_generate": True,
-                    "output_hidden_states": True,
-                    "output_scores": True,
-                    "pad_token_id": self.tokenizer.pad_token_id,
-                    "renormalize_logits": True,
-                    "logits_processor": safety_processors
-                }
-                outputs = self.model.generate(**final_gen_kwargs)
+            seq_i = outputs.sequences[i]           # [full_seq_len]
+            new_tokens = seq_i[prompt_len:]
 
-                transition_scores = None
-                if hasattr(outputs, "scores"):
-                    if hasattr(outputs, "beam_indices") and outputs.beam_indices is not None:
-                        transition_scores = self.model.compute_transition_scores(
-                            outputs.sequences, outputs.scores, beam_indices=outputs.beam_indices, normalize_logits=True
-                        )
-                    else:
-                        transition_scores = self.model.compute_transition_scores(
-                            outputs.sequences, outputs.scores, normalize_logits=True
-                        )
-
-            new_tokens = outputs.sequences[0, prompt_len:]
-
-            stop_masks = (new_tokens == self.tokenizer.eos_token_id) | (new_tokens == self.tokenizer.pad_token_id)
+            # Locate EOS / PAD to find actual generation length
+            stop_masks = (new_tokens == self.tokenizer.eos_token_id) | \
+                         (new_tokens == self.tokenizer.pad_token_id)
             stop_indices = stop_masks.nonzero(as_tuple=True)[0]
             total_generated = stop_indices[0].item() if len(stop_indices) > 0 else len(new_tokens)
 
             valid_tokens = new_tokens[:total_generated]
             full_output_text = self.tokenizer.decode(valid_tokens, skip_special_tokens=True)
 
+            # Log-probs from pre-computed transition scores
             token_logprobs = []
             if transition_scores is not None and total_generated > 0:
-                for s in transition_scores[0, :total_generated].cpu().numpy():
+                for s in transition_scores[i, :total_generated].cpu().numpy():
                     val = float(s)
                     if math.isinf(val) or math.isnan(val):
                         val = -15.0
                     token_logprobs.append(round(val, 4))
 
+            # Hidden-state extraction: one forward pass on the completed sequence.
+            # Because of causal masking, hidden_states[t] is identical whether
+            # computed during autoregressive decoding or in a single forward pass.
             target_indices = self._resolve_target_tokens(total_generated, token_config)
             filtered_tokens_data = []
 
             if target_indices:
+                full_seq_i = seq_i[:prompt_len + total_generated].unsqueeze(0)  # [1, prompt+gen]
+                with torch.no_grad():
+                    fwd = self.model(full_seq_i, output_hidden_states=True, use_cache=False)
+
                 layer_tensors = []
                 for l in target_layers:
-                    hf_layer_idx = l + 1
-                    step_tensors = []
-                    for step in target_indices:
-                        seq_idx = -1 if step == 0 else 0
-                        step_tensors.append(outputs.hidden_states[step][hf_layer_idx][0, seq_idx, :])
+                    hf_l_idx = l + 1
+                    # ans_hs: [total_generated, hidden_size]
+                    ans_hs = fwd.hidden_states[hf_l_idx][0, prompt_len:prompt_len + total_generated, :]
+                    step_tensors = [ans_hs[step] for step in target_indices]
                     layer_tensors.append(torch.stack(step_tensors))
 
-                mega_tensor_gpu = torch.stack(layer_tensors)
+                mega_tensor_gpu = torch.stack(layer_tensors)   # [L, T, H]
                 mega_tensor_cpu = mega_tensor_gpu.cpu().float().numpy().astype(ml_dtypes.bfloat16)
+
+                del fwd, layer_tensors, mega_tensor_gpu
+                torch.cuda.empty_cache()
 
                 for idx_enum, step in enumerate(target_indices):
                     token_id = valid_tokens[step].item()
@@ -177,8 +189,8 @@ class StochasticExtractor(HiddenStateExtractor):
                 "filtered_tokens_data": filtered_tokens_data
             })
 
-            del outputs, transition_scores
-            torch.cuda.empty_cache()
+        del outputs, transition_scores
+        torch.cuda.empty_cache()
 
         return batch_results
 
@@ -203,8 +215,7 @@ class StochasticExtractor(HiddenStateExtractor):
                             pass
 
         if existing_ids:
-            print(
-                f"[*] Recovery manager tracking: Found {len(existing_ids)} completed historical items. Skipping records...")
+            print(f"[*] Recovery manager tracking: Found {len(existing_ids)} completed historical items. Skipping records...")
 
         data_queue = mp.Queue(maxsize=max_queue_size)
         writer_process = mp.Process(
@@ -261,8 +272,7 @@ class StochasticExtractor(HiddenStateExtractor):
                     }, block=True)
                     processed_count += 1
                 except Exception as e:
-                    print(
-                        f"\n[!] Unexpected runtime exception for sequence item {sample_id}. Diverting into Dead Letter Queue (DLQ). Log exception: {e}")
+                    print(f"\n[!] Unexpected runtime exception for sequence item {sample_id}. Diverting into Dead Letter Queue (DLQ). Log exception: {e}")
                     error_log_path = output_jsonl_path + ".failed_ids.txt"
                     with open(error_log_path, 'a', encoding='utf-8') as f_err:
                         f_err.write(f"{sample_id}\t{e}\n")
@@ -270,12 +280,10 @@ class StochasticExtractor(HiddenStateExtractor):
                     continue
 
         except KeyboardInterrupt:
-            print(
-                "\n[!] Execution cycle interrupted via system interrupt command. Shutting down worker pathways safely...")
+            print("\n[!] Execution cycle interrupted via system interrupt command. Shutting down worker pathways safely...")
         finally:
             data_queue.put(None)
             writer_process.join(timeout=10)
             if writer_process.is_alive():
                 writer_process.terminate()
-            print(
-                f"[+] Generative tracking cycle terminated safely. Bypassed {skipped_count} existing tracks, serialized {processed_count} execution sequences.")
+            print(f"[+] Generative tracking cycle terminated safely. Bypassed {skipped_count} existing tracks, serialized {processed_count} execution sequences.")
