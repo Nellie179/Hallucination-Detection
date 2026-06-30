@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OpenHalDet Leaderboard</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #22263a;
+    --border: #2d3148;
+    --text: #e8eaf0;
+    --muted: #7880a0;
+    --accent: #6c8cff;
+    --black: #60a5fa;
+    --gray: #fbbf24;
+    --white: #34d399;
+    --gold: #f59e42;
+    --silver: #94a3b8;
+    --bronze: #b87444;
+    --font-mono: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+    --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+    --radius: 8px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body { background: var(--bg); color: var(--text); font-family: var(--font-sans); font-size: 14px; line-height: 1.6; }
+
+  /* HEADER */
+  header { padding: 48px 0 32px; text-align: center; border-bottom: 1px solid var(--border); }
+  .badge-row { display: flex; gap: 8px; justify-content: center; margin-bottom: 24px; flex-wrap: wrap; }
+  .badge { display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; text-decoration: none; }
+  .badge-paper { background: #1e2a4a; color: #93c5fd; border: 1px solid #2d4070; }
+  .badge-code  { background: #1a2a1a; color: #86efac; border: 1px solid #2a4a2a; }
+  .badge-arxiv { background: #2a1a1a; color: #fca5a5; border: 1px solid #4a2a2a; }
+  h1 { font-size: 2.4rem; font-weight: 800; letter-spacing: -0.03em; color: #fff; margin-bottom: 10px; }
+  .subtitle { color: var(--muted); max-width: 680px; margin: 0 auto 24px; font-size: 15px; line-height: 1.7; }
+  .stat-row { display: flex; gap: 32px; justify-content: center; flex-wrap: wrap; }
+  .stat { text-align: center; }
+  .stat-n { font-size: 1.8rem; font-weight: 800; color: var(--accent); font-family: var(--font-mono); }
+  .stat-l { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.1em; margin-top: 2px; }
+
+  /* TABS */
+  .tab-bar { display: flex; gap: 0; border-bottom: 1px solid var(--border); max-width: 1200px; margin: 0 auto; padding: 0 24px; }
+  .tab-btn { padding: 14px 20px; cursor: pointer; color: var(--muted); font-size: 14px; font-weight: 500; border: none; background: none; border-bottom: 2px solid transparent; transition: color 0.15s, border-color 0.15s; }
+  .tab-btn:hover { color: var(--text); }
+  .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  /* CONTROLS */
+  .controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; max-width: 1200px; margin: 20px auto 16px; padding: 0 24px; }
+  .controls-label { color: var(--muted); font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; white-space: nowrap; }
+  .btn-group { display: flex; gap: 4px; flex-wrap: wrap; }
+  .ctrl-btn { padding: 5px 14px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); color: var(--muted); cursor: pointer; font-size: 13px; font-weight: 500; transition: all 0.15s; }
+  .ctrl-btn:hover { border-color: var(--accent); color: var(--text); }
+  .ctrl-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .ctrl-btn.bb.active  { background: var(--black); border-color: var(--black); color: #000; }
+  .ctrl-btn.gb.active  { background: var(--gray); border-color: var(--gray); color: #000; }
+  .ctrl-btn.wb.active  { background: var(--white); border-color: var(--white); color: #000; }
+  .sep { width: 1px; height: 24px; background: var(--border); }
+
+  /* SECTION */
+  .section { display: none; max-width: 1200px; margin: 0 auto; padding: 0 24px 64px; }
+  .section.active { display: block; }
+
+  /* TABLE */
+  .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius); margin-top: 4px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  thead th { background: var(--surface); padding: 10px 12px; text-align: right; font-weight: 600; color: var(--muted); white-space: nowrap; border-bottom: 1px solid var(--border); cursor: pointer; user-select: none; position: sticky; top: 0; }
+  thead th:first-child, thead th:nth-child(2) { text-align: left; }
+  thead th:hover { color: var(--text); }
+  thead th.sorted { color: var(--accent); }
+  thead th .sort-icon { margin-left: 4px; opacity: 0.5; font-size: 10px; }
+  thead th.sorted .sort-icon { opacity: 1; }
+  tbody tr { border-bottom: 1px solid var(--border); transition: background 0.1s; }
+  tbody tr:last-child { border-bottom: none; }
+  tbody tr:hover { background: var(--surface2); }
+  tbody tr.hidden { display: none; }
+  tbody td { padding: 9px 12px; text-align: right; font-family: var(--font-mono); font-size: 12.5px; color: var(--text); }
+  tbody td:first-child { text-align: left; font-family: var(--font-sans); font-weight: 600; font-size: 13px; white-space: nowrap; }
+  tbody td:nth-child(2) { text-align: left; font-family: var(--font-sans); }
+
+  /* family badges */
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+  .tag-bb { background: rgba(96,165,250,0.15); color: var(--black); }
+  .tag-gb { background: rgba(251,191,36,0.15); color: var(--gray); }
+  .tag-wb { background: rgba(52,211,153,0.15); color: var(--white); }
+
+  /* score highlights */
+  .rank-1 { color: var(--gold); font-weight: 700; }
+  .rank-2 { color: var(--silver); font-weight: 600; }
+  .rank-3 { color: var(--bronze); font-weight: 600; }
+
+  /* SUBMIT */
+  .submit-box { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 32px; margin-top: 32px; }
+  .submit-box h2 { font-size: 1.2rem; font-weight: 700; color: #fff; margin-bottom: 12px; }
+  .submit-box p { color: var(--muted); margin-bottom: 16px; line-height: 1.7; }
+  .submit-box ol { color: var(--muted); padding-left: 20px; line-height: 2; }
+  .submit-box ol li code { background: var(--surface2); padding: 1px 6px; border-radius: 4px; color: var(--text); font-family: var(--font-mono); font-size: 12px; }
+  .submit-link { display: inline-flex; align-items: center; gap: 8px; margin-top: 16px; padding: 10px 20px; background: var(--accent); color: #fff; border-radius: 8px; text-decoration: none; font-weight: 600; font-size: 14px; }
+  .submit-link:hover { opacity: 0.85; }
+
+  /* DATASET GROUP TABS */
+  .ds-tab-bar { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 16px; }
+  .ds-tab { padding: 5px 14px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); color: var(--muted); cursor: pointer; font-size: 12px; font-weight: 500; transition: all 0.15s; }
+  .ds-tab:hover { color: var(--text); }
+  .ds-tab.active { background: var(--surface2); border-color: var(--accent); color: var(--text); }
+
+  /* overall col */
+  th.col-overall, td.col-overall { background: rgba(108,140,255,0.07) !important; }
+
+  footer { text-align: center; padding: 32px; color: var(--muted); font-size: 12px; border-top: 1px solid var(--border); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="badge-row">
+    <a class="badge badge-arxiv" href="https://arxiv.org/abs/2606.06959" target="_blank">📄 arXiv 2606.06959</a>
+    <a class="badge badge-code" href="https://github.com/Nellie179/Hallucination-Detection" target="_blank">🐙 GitHub</a>
+    <a class="badge badge-paper" href="https://arxiv.org/abs/2606.06959" target="_blank">📘 Paper (Preprint)</a>
+  </div>
+  <h1>OpenHalDet Leaderboard</h1>
+  <p class="subtitle">A unified benchmark for hallucination detection across diverse LLM generation scenarios. Standardized evaluation of 16 detectors across 17 datasets and 4 backbone LLMs.</p>
+  <div class="stat-row">
+    <div class="stat"><div class="stat-n">17</div><div class="stat-l">Datasets</div></div>
+    <div class="stat"><div class="stat-n">16</div><div class="stat-l">Detectors</div></div>
+    <div class="stat"><div class="stat-n">4</div><div class="stat-l">Backbone LLMs</div></div>
+    <div class="stat"><div class="stat-n">8</div><div class="stat-l">Scenarios</div></div>
+  </div>
+</header>
+
+<div class="tab-bar">
+  <button class="tab-btn active" onclick="showTab('scenario')">📊 Scenario Overview</button>
+  <button class="tab-btn" onclick="showTab('dataset')">🔬 Per-Dataset Results</button>
+  <button class="tab-btn" onclick="showTab('submit')">➕ Submit Results</button>
+</div>
+
+<!-- ===== SCENARIO OVERVIEW ===== -->
+<div id="tab-scenario" class="section active">
+  <div class="controls">
+    <span class="controls-label">Backbone</span>
+    <div class="btn-group" id="bb-btns">
+      <button class="ctrl-btn active" onclick="setBackbone('llama31')">Llama-3.1-8B</button>
+      <button class="ctrl-btn" onclick="setBackbone('llama32')">Llama-3.2-3B</button>
+      <button class="ctrl-btn" onclick="setBackbone('qwen8')">Qwen3-8B</button>
+      <button class="ctrl-btn" onclick="setBackbone('qwen14')">Qwen3-14B</button>
+    </div>
+    <div class="sep"></div>
+    <span class="controls-label">Family</span>
+    <div class="btn-group">
+      <button class="ctrl-btn active" id="fam-all" onclick="setFamily('all')">All</button>
+      <button class="ctrl-btn bb" id="fam-bb" onclick="setFamily('bb')">Black-box</button>
+      <button class="ctrl-btn gb" id="fam-gb" onclick="setFamily('gb')">Gray-box</button>
+      <button class="ctrl-btn wb" id="fam-wb" onclick="setFamily('wb')">White-box</button>
+    </div>
+  </div>
+  <div class="table-wrap">
+    <table id="scenario-table">
+      <thead>
+        <tr>
+          <th onclick="sortTable('scenario-table',0)">Method <span class="sort-icon">↕</span></th>
+          <th onclick="sortTable('scenario-table',1)">Access <span class="sort-icon">↕</span></th>
+          <th onclick="sortTable('scenario-table',2)">QA <span class="sort-icon">↕</span></th>
+          <th onclick="sortTable('scenario-table',3)">RAG <span class="sort-icon">↕</span></th>
+          <th onclick="sortTable('scenario-table',4)">Sum. <span class="sort-icon">↕</span></th>
+          <th onclick="sortTable('scenario-table',5)">Math <span class="sort-icon">↕</span></th>
+          <th onclick="sortTable('scenario-table',6)">Science <span class="sort-icon">↕</span></th>
+          <th onclick="sortTable('scenario-table',7)">Code <span class="sort-icon">↕</span></th>
+          <th onclick="sortTable('scenario-table',8)">Agent <span class="sort-icon">↕</span></th>
+          <th onclick="sortTable('scenario-table',9)">Multi. <span class="sort-icon">↕</span></th>
+          <th class="col-overall" onclick="sortTable('scenario-table',10)">Avg. <span class="sort-icon">↕</span></th>
+        </tr>
+      </thead>
+      <tbody id="scenario-body"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ===== PER-DATASET ===== -->
+<div id="tab-dataset" class="section">
+  <div class="controls">
+    <span class="controls-label">Backbone</span>
+    <div class="btn-group" id="ds-bb-btns">
+      <button class="ctrl-btn active" onclick="setDsBackbone('llama31')">Llama-3.1-8B</button>
+      <button class="ctrl-btn" onclick="setDsBackbone('llama32')">Llama-3.2-3B</button>
+      <button class="ctrl-btn" onclick="setDsBackbone('qwen8')">Qwen3-8B</button>
+      <button class="ctrl-btn" onclick="setDsBackbone('qwen14')">Qwen3-14B</button>
+    </div>
+    <div class="sep"></div>
+    <span class="controls-label">Family</span>
+    <div class="btn-group">
+      <button class="ctrl-btn active" id="ds-fam-all" onclick="setDsFamily('all')">All</button>
+      <button class="ctrl-btn bb" id="ds-fam-bb" onclick="setDsFamily('bb')">Black-box</button>
+      <button class="ctrl-btn gb" id="ds-fam-gb" onclick="setDsFamily('gb')">Gray-box</button>
+      <button class="ctrl-btn wb" id="ds-fam-wb" onclick="setDsFamily('wb')">White-box</button>
+    </div>
+  </div>
+  <div class="ds-tab-bar">
+    <button class="ds-tab active" onclick="setDsGroup('all')">All Datasets</button>
+    <button class="ds-tab" onclick="setDsGroup('qa')">QA (8)</button>
+    <button class="ds-tab" onclick="setDsGroup('rag')">RAG</button>
+    <button class="ds-tab" onclick="setDsGroup('sum')">Summarization</button>
+    <button class="ds-tab" onclick="setDsGroup('math')">Math (2)</button>
+    <button class="ds-tab" onclick="setDsGroup('sci')">Science</button>
+    <button class="ds-tab" onclick="setDsGroup('code')">Code (2)</button>
+    <button class="ds-tab" onclick="setDsGroup('agent')">Agentic</button>
+    <button class="ds-tab" onclick="setDsGroup('multi')">Multilingual</button>
+  </div>
+  <div class="table-wrap">
+    <table id="dataset-table">
+      <thead id="dataset-head"></thead>
+      <tbody id="dataset-body"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ===== SUBMIT ===== -->
+<div id="tab-submit" class="section">
+  <div class="submit-box">
+    <h2>Submit New Results to the Leaderboard</h2>
+    <p>We welcome results from new detectors or new backbone LLMs evaluated with the standard OpenHalDet protocol. To ensure comparability, please use the provided pipeline for response generation, annotation, and evaluation.</p>
+    <ol>
+      <li>Run the OpenHalDet pipeline: <code>python datasets_v1/generate_pipeline.py</code></li>
+      <li>Evaluate your detector: <code>python baseline_detectors/runner.py</code></li>
+      <li>Open a GitHub Issue with the title <code>[Leaderboard] Method Name — Backbone</code></li>
+      <li>Include: method name, access regime, AUROC per dataset, backbone, and a link to your paper or code</li>
+    </ol>
+    <a class="submit-link" href="https://github.com/Nellie179/Hallucination-Detection/issues/new" target="_blank">Open a GitHub Issue →</a>
+  </div>
+</div>
+
+<footer>OpenHalDet · University of Technology Sydney · arXiv 2606.06959 · Results from Table 2 &amp; Table 9 of the paper</footer>
+
+<script>
+// ── DATA ──────────────────────────────────────────────────────────────────────
+const METHODS = [
+  {id:'verbalize',   name:'Verbalized Conf.',   fam:'bb'},
+  {id:'sc_bert',     name:'SelfCheck-BERT',     fam:'bb'},
+  {id:'sc_nli',      name:'SelfCheck-NLI',      fam:'bb'},
+  {id:'lexsim',      name:'Lexical Similarity', fam:'bb'},
+  {id:'perplexity',  name:'Perplexity',         fam:'gb'},
+  {id:'selfeval',    name:'Self-Evaluation',    fam:'gb'},
+  {id:'ln_entropy',  name:'LN-Entropy',         fam:'gb'},
+  {id:'sar',         name:'SAR',                fam:'gb'},
+  {id:'sem_entropy', name:'Semantic Entropy',   fam:'gb'},
+  {id:'eigenscore',  name:'EigenScore',         fam:'wb'},
+  {id:'ccs',         name:'CCS',                fam:'wb'},
+  {id:'haloscope',   name:'HaloScope',          fam:'wb'},
+  {id:'saplma',      name:'SAPLMA',             fam:'wb'},
+  {id:'mind',        name:'MIND',               fam:'wb'},
+  {id:'sep',         name:'SEP',                fam:'wb'},
+  {id:'icr_probe',   name:'ICR Probe',          fam:'wb'},
+  {id:'prism',       name:'PRISM',              fam:'wb'},
+];
+
+// Table 2: scenario-level AUROC [QA, RAG, Sum, Math, Sci, Code, Agent, Multi]
+const SCENARIO = {
+  llama31: {
+    verbalize:   [68.46,61.23,55.91,66.40,63.49,58.76,54.46,51.09],
+    sc_bert:     [72.91,69.98,61.50,73.36,73.92,67.35,78.82,73.84],
+    sc_nli:      [73.69,71.25,64.37,80.97,52.55,55.44,66.49,66.07],
+    lexsim:      [65.69,59.91,56.79,74.68,63.80,62.88,62.59,65.77],
+    perplexity:  [75.99,70.76,64.35,78.34,64.48,63.78,83.24,69.21],
+    selfeval:    [71.55,72.95,63.62,79.84,65.92,68.67,62.86,50.46],
+    ln_entropy:  [66.07,68.45,54.57,75.99,73.35,71.01,67.41,70.43],
+    sar:         [65.67,67.33,53.12,76.18,73.84,68.38,68.32,71.95],
+    sem_entropy: [62.50,51.26,52.13,50.90,61.30,66.63,60.23,64.78],
+    eigenscore:  [62.02,56.45,50.76,72.14,51.25,72.14,62.19,53.00],
+    ccs:         [55.51,54.43,54.08,68.97,74.77,53.58,52.63,50.78],
+    haloscope:   [60.57,61.28,51.67,63.95,58.90,65.03,62.05,67.17],
+    saplma:      [81.03,77.98,66.60,83.32,69.87,71.24,93.15,68.22],
+    mind:        [77.52,65.23,61.79,84.08,79.23,63.95,92.18,72.68],
+    sep:         [81.00,74.46,64.80,82.54,76.24,68.41,87.82,69.76],
+    icr_probe:   [60.65,57.34,58.14,56.72,73.90,65.33,61.36,58.57],
+    prism:       [81.98,80.21,67.65,81.06,80.51,67.75,87.47,61.38],
+  },
+  llama32: {
+    verbalize:   [63.00,60.09,51.05,55.07,50.96,53.95,50.34,51.38],
+    sc_bert:     [71.20,54.33,61.27,67.45,74.07,68.32,70.27,76.27],
+    sc_nli:      [69.80,60.57,69.98,76.64,55.82,56.21,68.25,74.89],
+    lexsim:      [71.02,57.34,60.74,68.82,66.64,71.91,66.05,75.37],
+    perplexity:  [71.24,62.07,57.91,66.62,51.30,54.35,65.80,79.07],
+    selfeval:    [68.46,59.22,59.34,75.84,57.69,77.40,59.56,52.24],
+    ln_entropy:  [69.71,54.33,55.22,72.99,66.01,67.85,69.29,78.87],
+    sar:         [69.98,52.34,53.90,71.99,62.07,69.34,70.49,80.27],
+    sem_entropy: [65.96,60.34,56.05,51.64,52.68,57.70,63.24,76.36],
+    eigenscore:  [64.48,54.77,53.28,66.48,62.48,77.39,65.37,66.66],
+    ccs:         [53.82,57.21,54.78,64.58,61.74,59.66,50.93,59.68],
+    haloscope:   [60.89,57.74,53.99,64.35,57.04,65.03,59.42,69.67],
+    saplma:      [76.04,70.34,56.57,76.47,78.61,73.23,85.83,67.95],
+    mind:        [78.40,62.91,59.41,79.00,80.95,65.53,88.03,75.11],
+    sep:         [65.83,51.35,56.15,63.52,57.43,60.98,65.77,73.48],
+    icr_probe:   [57.88,53.38,61.37,53.17,54.65,62.91,71.35,62.49],
+    prism:       [74.11,62.00,62.41,74.82,79.67,65.35,77.25,67.78],
+  },
+  qwen8: {
+    verbalize:   [61.94,63.52,51.79,53.86,59.17,56.55,69.36,51.68],
+    sc_bert:     [62.06,53.97,57.45,56.84,59.00,53.16,67.17,54.63],
+    sc_nli:      [62.57,67.86,59.16,68.24,52.99,59.29,61.56,64.98],
+    lexsim:      [59.53,55.87,55.92,70.07,71.56,59.45,65.10,51.68],
+    perplexity:  [66.64,68.97,55.29,63.04,64.79,57.80,78.60,59.88],
+    selfeval:    [76.85,56.66,60.21,77.25,71.40,64.50,79.32,54.18],
+    ln_entropy:  [64.67,69.87,55.29,65.47,74.07,57.80,78.60,59.88],
+    sar:         [60.90,64.32,56.04,70.17,72.87,62.33,67.85,55.75],
+    sem_entropy: [58.96,61.23,52.32,58.26,58.21,64.43,58.30,51.69],
+    eigenscore:  [59.36,55.98,54.45,68.91,68.94,62.89,60.59,56.28],
+    ccs:         [58.24,56.87,51.24,73.39,65.80,63.03,50.91,60.70],
+    haloscope:   [59.23,56.63,52.71,68.68,52.94,53.13,56.84,58.71],
+    saplma:      [80.88,73.42,65.03,75.49,76.45,60.14,89.77,63.51],
+    mind:        [75.40,79.21,67.38,73.59,79.44,62.26,88.48,72.08],
+    sep:         [64.82,59.21,52.77,57.66,55.12,59.35,74.28,63.92],
+    icr_probe:   [60.62,57.87,51.59,59.01,50.28,57.07,60.26,60.05],
+    prism:       [73.68,60.34,65.52,70.45,74.53,52.12,80.74,62.53],
+  },
+  qwen14: {
+    verbalize:   [64.44,67.82,54.23,58.89,51.28,60.52,58.94,64.55],
+    sc_bert:     [60.25,54.08,54.17,66.41,64.61,58.14,70.19,52.66],
+    sc_nli:      [62.91,70.04,58.89,61.08,50.49,62.50,59.80,67.92],
+    lexsim:      [60.85,52.66,51.94,82.39,66.36,62.23,63.52,55.68],
+    perplexity:  [67.20,73.76,54.13,77.60,55.33,67.81,79.90,73.73],
+    selfeval:    [73.91,53.99,61.57,81.90,70.92,61.55,72.09,63.34],
+    ln_entropy:  [62.52,73.76,50.97,82.53,69.35,58.13,68.80,55.69],
+    sar:         [62.02,74.65,50.63,78.36,66.13,54.84,70.74,55.45],
+    sem_entropy: [58.68,57.89,52.01,61.55,62.33,57.04,58.49,55.69],
+    eigenscore:  [59.84,53.12,50.06,81.99,66.00,53.73,68.15,54.48],
+    ccs:         [61.70,57.45,53.70,71.78,65.56,53.62,55.13,50.74],
+    haloscope:   [56.64,57.45,52.45,69.86,60.60,50.94,57.11,62.37],
+    saplma:      [73.98,76.42,64.95,77.18,72.30,61.59,87.97,74.92],
+    mind:        [78.31,83.69,66.07,79.37,80.64,54.01,87.59,75.20],
+    sep:         [72.90,53.90,65.09,58.30,63.81,69.38,83.13,71.30],
+    icr_probe:   [60.31,60.12,51.96,70.89,55.16,52.98,50.36,60.83],
+    prism:       [70.97,68.97,66.50,71.88,72.09,56.35,82.62,57.37],
+  }
+};
+
+// Table 9: per-dataset AUROC
+// Columns: ARC,CSQA,Trivia,TruthfulQA,SQuAD,Hotpot,CoQA,HaluQA, RAGTruth,XSum, GSM8K,SVAMP, ThmQA, HEval,MBPP, xLAM, Beleb
+const DATASETS = {
+  llama31: {
+    verbalize:   [68.26,59.38,82.55,71.30,78.00,59.23,67.43,61.54, 61.23,55.91, 62.90,69.90, 63.49, 60.00,57.52, 54.46, 51.09],
+    sc_bert:     [74.34,68.96,87.35,61.09,76.84,55.47,77.60,81.66, 69.98,61.50, 60.97,85.75, 73.92, 60.00,74.70, 78.82, 73.84],
+    sc_nli:      [72.08,67.88,92.01,66.56,70.72,64.35,76.40,79.50, 71.25,64.37, 83.26,78.67, 52.55, 53.04,57.83, 66.49, 66.07],
+    lexsim:      [55.72,68.42,75.88,55.17,75.14,57.33,67.20,70.64, 59.91,56.79, 72.32,77.04, 63.80, 62.61,63.15, 62.59, 65.77],
+    perplexity:  [79.08,75.77,91.04,61.56,75.59,64.34,78.07,82.46, 70.76,64.35, 77.22,79.46, 64.48, 67.83,59.73, 83.24, 69.21],
+    selfeval:    [67.83,67.57,87.82,55.11,82.22,60.01,76.68,75.16, 72.95,63.62, 77.09,82.58, 65.92, 74.57,62.77, 62.86, 50.46],
+    ln_entropy:  [57.61,71.24,73.87,50.83,76.16,60.21,67.25,71.38, 68.45,54.57, 76.06,75.92, 73.35, 73.48,68.54, 67.41, 70.43],
+    sar:         [59.46,71.04,73.13,50.39,73.28,59.23,66.27,72.54, 67.33,53.12, 74.77,77.58, 73.84, 67.83,68.92, 68.32, 71.95],
+    sem_entropy: [55.03,68.51,70.85,55.13,61.53,61.23,59.33,68.35, 51.26,52.13, 51.51,50.29, 61.30, 73.91,59.35, 60.23, 64.78],
+    eigenscore:  [54.78,50.87,72.95,53.28,73.41,55.67,64.85,70.32, 56.45,50.76, 66.23,78.04, 51.25, 69.57,74.70, 62.19, 53.00],
+    ccs:         [59.31,50.26,58.95,53.23,50.58,62.34,57.17,52.24, 54.43,54.08, 60.27,77.67, 74.77, 54.35,52.81, 52.63, 50.78],
+    haloscope:   [67.98,62.30,56.30,59.52,62.17,61.12,60.27,54.91, 61.28,51.67, 60.74,67.15, 58.90, 74.35,55.70, 62.05, 67.17],
+    saplma:      [81.27,72.12,91.72,76.89,88.67,71.72,80.27,85.61, 77.98,66.60, 83.01,83.62, 69.87, 81.30,61.17, 93.15, 68.22],
+    mind:        [75.33,77.58,86.87,77.30,80.70,63.21,73.19,85.95, 65.23,61.79, 78.86,89.29, 79.23, 63.04,64.86, 92.18, 72.68],
+    sep:         [81.95,69.31,89.98,76.84,88.25,76.32,79.05,86.26, 74.46,64.80, 78.62,86.46, 76.24, 74.35,62.46, 87.82, 69.76],
+    icr_probe:   [68.16,65.24,62.90,59.88,53.61,58.27,52.23,64.87, 57.34,58.14, 54.11,59.33, 73.90, 65.22,65.43, 61.36, 58.57],
+    prism:       [77.46,73.03,91.25,75.88,90.18,79.91,80.96,87.16, 80.21,67.65, 77.24,84.88, 80.51, 66.96,68.54, 87.47, 61.38],
+  },
+  llama32: {
+    verbalize:   [50.76,58.04,74.27,59.49,66.39,63.64,63.31,68.13, 60.09,51.05, 50.91,59.23, 50.96, 56.52,51.37, 50.34, 51.38],
+    sc_bert:     [70.54,67.43,82.67,59.54,70.00,70.58,68.79,80.03, 54.33,61.27, 62.21,72.69, 74.07, 66.96,69.68, 70.27, 76.27],
+    sc_nli:      [66.17,65.02,84.52,66.26,65.36,70.68,69.05,71.30, 60.57,69.98, 82.58,70.70, 55.82, 52.61,59.80, 68.25, 74.89],
+    lexsim:      [66.30,66.38,82.50,61.79,70.45,71.96,69.89,78.92, 57.34,60.74, 71.67,65.96, 66.64, 72.61,71.20, 66.05, 75.37],
+    perplexity:  [73.51,72.14,83.10,55.75,70.83,64.04,71.13,79.45, 62.07,57.91, 68.47,64.76, 51.30, 52.61,56.08, 65.80, 79.07],
+    selfeval:    [52.60,64.38,76.17,59.24,75.40,74.90,70.51,74.46, 59.22,59.34, 71.94,79.74, 57.69, 86.74,68.05, 59.56, 52.24],
+    ln_entropy:  [70.48,68.14,81.35,50.88,69.60,70.81,67.26,79.13, 54.33,55.22, 76.15,69.83, 66.01, 69.13,66.57, 69.29, 78.87],
+    sar:         [71.38,68.87,82.78,52.06,67.43,70.25,66.55,80.48, 52.34,53.90, 73.88,70.09, 62.07, 68.70,69.98, 70.49, 80.27],
+    sem_entropy: [66.48,65.49,79.14,54.42,63.68,62.76,61.60,74.10, 60.34,56.05, 50.33,52.95, 52.68, 60.00,55.40, 63.24, 76.36],
+    eigenscore:  [51.81,50.24,79.84,51.72,68.04,70.32,65.06,78.84, 54.77,53.28, 67.84,65.11, 62.48, 76.96,77.81, 65.37, 66.66],
+    ccs:         [53.67,50.92,58.58,50.78,52.98,52.50,55.85,55.26, 57.21,54.78, 61.29,67.87, 61.74, 63.91,55.40, 50.93, 59.68],
+    haloscope:   [67.98,65.59,56.30,59.52,62.17,60.37,60.27,54.91, 57.74,53.99, 60.74,67.95, 57.04, 74.35,55.70, 59.42, 69.67],
+    saplma:      [69.11,70.48,82.69,75.15,80.70,77.51,70.82,81.85, 70.34,56.57, 81.44,71.49, 78.61, 77.83,68.62, 85.83, 67.95],
+    mind:        [75.35,74.21,85.99,75.31,80.18,76.56,73.01,86.57, 62.91,59.41, 78.28,79.72, 80.95, 67.83,63.22, 88.03, 75.11],
+    sep:         [71.52,65.76,72.35,52.59,65.33,62.25,61.87,74.97, 51.35,56.15, 75.96,51.08, 57.43, 54.78,67.17, 65.77, 73.48],
+    icr_probe:   [60.90,52.83,61.61,62.59,50.13,55.72,53.32,65.95, 53.38,61.37, 52.42,53.92, 54.65, 58.26,67.55, 71.35, 62.49],
+    prism:       [67.82,69.00,83.07,73.95,81.55,69.97,69.18,78.35, 62.00,62.41, 76.61,73.02, 79.67, 63.91,66.79, 77.25, 67.78],
+  },
+  qwen8: {
+    verbalize:   [58.74,60.17,57.71,63.51,68.05,62.50,57.74,67.08, 63.52,51.79, 50.00,57.71, 59.17, 59.09,54.00, 69.36, 51.68],
+    sc_bert:     [56.24,56.91,64.18,61.46,56.46,72.66,59.06,69.47, 53.97,57.45, 58.20,55.47, 59.00, 51.24,55.08, 67.17, 54.63],
+    sc_nli:      [59.57,58.09,83.57,66.56,61.20,62.50,55.20,53.84, 67.86,59.16, 65.09,71.39, 52.99, 67.77,50.80, 61.56, 64.98],
+    lexsim:      [51.92,54.91,72.91,62.42,59.09,52.34,59.50,63.16, 55.87,55.92, 71.98,68.16, 71.56, 65.29,53.60, 65.10, 51.68],
+    perplexity:  [70.65,72.12,75.72,63.23,60.61,53.12,62.97,74.71, 68.97,55.29, 67.37,58.71, 64.79, 64.88,50.72, 78.60, 59.88],
+    selfeval:    [76.44,73.21,78.08,60.37,79.24,96.88,75.05,75.51, 56.66,60.21, 81.23,73.26, 71.40, 74.59,54.40, 79.32, 54.18],
+    ln_entropy:  [70.65,56.31,75.72,63.23,60.61,53.12,62.97,74.71, 69.87,55.29, 67.37,63.56, 74.07, 64.88,50.72, 78.60, 59.88],
+    sar:         [58.12,56.25,74.92,59.77,56.66,56.25,60.95,64.30, 64.32,56.04, 74.16,66.17, 72.87, 68.18,56.48, 67.85, 55.75],
+    sem_entropy: [51.92,54.98,71.51,58.45,57.54,57.81,58.17,61.27, 61.23,52.32, 54.70,61.82, 58.21, 71.69,57.16, 58.30, 51.69],
+    eigenscore:  [56.99,52.97,74.23,53.38,55.77,54.69,60.60,66.25, 55.98,54.45, 72.88,64.93, 68.94, 73.14,52.64, 60.59, 56.28],
+    ccs:         [52.02,51.06,65.75,60.45,52.67,82.81,50.52,50.66, 56.87,51.24, 69.91,76.87, 65.80, 69.01,57.04, 50.91, 60.70],
+    haloscope:   [62.12,61.31,59.42,60.96,57.87,59.38,51.00,61.75, 56.63,52.71, 56.89,80.47, 52.94, 55.37,50.88, 56.84, 58.71],
+    saplma:      [71.91,76.43,85.41,85.71,83.76,95.31,70.63,77.91, 73.42,65.03, 83.19,67.79, 76.45, 63.64,56.64, 89.77, 63.51],
+    mind:        [61.07,76.06,89.51,80.84,86.47,57.81,69.80,81.62, 79.21,67.38, 76.52,70.65, 79.44, 58.68,65.84, 88.48, 72.08],
+    sep:         [67.17,69.82,69.49,58.31,61.63,64.06,61.27,66.78, 59.21,52.77, 50.39,64.93, 55.12, 51.65,67.04, 74.28, 63.92],
+    icr_probe:   [67.27,52.63,62.96,72.45,52.81,65.62,52.32,58.92, 57.87,51.59, 51.35,66.67, 50.28, 64.05,50.08, 60.26, 60.05],
+    prism:       [74.38,72.98,87.69,81.07,85.48,65.62,64.30,57.90, 60.34,65.52, 71.25,69.65, 74.53, 52.07,52.16, 80.74, 62.53],
+  },
+  qwen14: {
+    verbalize:   [57.14,59.78,63.72,65.23,61.78,74.00,58.63,75.26, 67.82,54.23, 60.19,57.58, 51.28, 70.00,51.03, 58.94, 64.55],
+    sc_bert:     [58.86,51.65,68.54,66.04,58.17,50.52,53.37,74.84, 54.08,54.17, 54.45,78.37, 64.61, 56.96,59.31, 70.19, 52.66],
+    sc_nli:      [50.66,58.23,82.57,67.08,62.79,56.91,59.41,65.60, 70.04,58.89, 53.71,68.44, 50.49, 52.61,72.39, 59.80, 67.92],
+    lexsim:      [50.27,52.89,76.02,64.90,64.05,50.17,56.37,72.14, 52.66,51.94, 66.40,98.37, 66.36, 64.57,59.89, 63.52, 55.68],
+    perplexity:  [66.60,67.65,77.96,68.86,65.18,52.84,60.13,78.38, 73.76,54.13, 73.72,81.48, 55.33, 73.04,62.58, 79.90, 73.73],
+    selfeval:    [72.71,67.60,86.13,59.75,79.35,71.66,75.38,78.72, 53.99,61.57, 63.95,99.85, 70.92, 64.35,58.74, 72.09, 63.34],
+    ln_entropy:  [52.65,54.53,76.59,65.31,64.37,54.53,59.38,72.83, 73.76,50.97, 66.09,98.96, 69.35, 61.52,54.74, 68.80, 55.69],
+    sar:         [54.52,53.59,74.84,62.48,63.44,55.91,56.22,75.18, 74.65,50.63, 66.93,89.78, 66.13, 56.09,53.59, 70.74, 55.45],
+    sem_entropy: [50.27,52.71,71.36,60.16,61.60,51.36,55.11,66.83, 57.89,52.01, 54.05,69.04, 62.33, 55.22,58.86, 58.49, 55.69],
+    eigenscore:  [54.77,50.47,74.27,60.50,63.36,53.42,57.50,64.42, 53.12,50.06, 67.67,96.30, 66.00, 54.35,53.10, 68.15, 54.48],
+    ccs:         [60.72,54.91,66.87,66.71,55.06,63.06,57.18,69.09, 57.45,53.70, 54.08,89.48, 65.56, 53.48,53.76, 55.13, 50.74],
+    haloscope:   [55.19,64.94,54.01,56.08,50.12,53.03,58.74,61.03, 57.45,52.45, 55.87,83.85, 60.60, 50.00,51.88, 57.11, 62.37],
+    saplma:      [69.43,65.70,86.55,75.09,84.22,70.28,73.01,67.52, 76.42,64.95, 60.14,94.22, 72.30, 56.09,67.08, 87.97, 74.92],
+    mind:        [75.73,68.41,88.56,75.27,84.95,74.12,79.01,80.44, 83.69,66.07, 70.88,87.85, 80.64, 50.00,58.01, 87.59, 75.20],
+    sep:         [54.71,66.84,86.31,78.98,85.75,67.59,72.29,70.71, 53.90,65.09, 57.19,59.41, 63.81, 74.78,63.97, 83.13, 71.30],
+    icr_probe:   [51.76,67.31,65.03,67.41,54.88,63.68,57.64,54.79, 60.12,51.96, 65.19,76.59, 55.16, 52.17,53.79, 50.36, 60.83],
+    prism:       [58.76,69.55,87.55,75.87,85.38,55.26,58.67,76.71, 68.97,66.50, 53.82,89.93, 72.09, 57.39,55.31, 82.62, 57.37],
+  }
+};
+
+const DS_COLS = [
+  {key:'arc',  label:'ARC',        group:'qa'},
+  {key:'csqa', label:'CSQA',       group:'qa'},
+  {key:'triv', label:'TriviaQA',   group:'qa'},
+  {key:'tqa',  label:'TruthfulQA', group:'qa'},
+  {key:'sq2',  label:'SQuAD v2',   group:'qa'},
+  {key:'hop',  label:'HotpotQA',   group:'qa'},
+  {key:'coqa', label:'CoQA',       group:'qa'},
+  {key:'halu', label:'HaluEval-QA',group:'qa'},
+  {key:'rag',  label:'RAGTruth',   group:'rag'},
+  {key:'xsum', label:'XSum',       group:'sum'},
+  {key:'gsm',  label:'GSM8K',      group:'math'},
+  {key:'svamp',label:'SVAMP',      group:'math'},
+  {key:'thm',  label:'TheoremQA', group:'sci'},
+  {key:'heval',label:'HumanEval',  group:'code'},
+  {key:'mbpp', label:'MBPP',       group:'code'},
+  {key:'xlam', label:'xLAM-Agent', group:'agent'},
+  {key:'beleb',label:'Belebele',   group:'multi'},
+];
+
+// ── STATE ─────────────────────────────────────────────────────────────────────
+let curBackbone = 'llama31';
+let curFamily   = 'all';
+let curDsBackbone = 'llama31';
+let curDsFamily   = 'all';
+let curDsGroup    = 'all';
+let sortCol = 10, sortDir = -1;
+let dsSortCol = 18, dsSortDir = -1;
+
+// ── UTILITIES ─────────────────────────────────────────────────────────────────
+function famTag(fam) {
+  return fam === 'bb' ? '<span class="tag tag-bb">Black-box</span>'
+       : fam === 'gb' ? '<span class="tag tag-gb">Gray-box</span>'
+       :                '<span class="tag tag-wb">White-box</span>';
+}
+
+function avg(arr) { return arr.reduce((a,b)=>a+b,0)/arr.length; }
+
+function topN(vals, n) {
+  const sorted = [...vals].sort((a,b)=>b-a);
+  return sorted.slice(0,n);
+}
+
+function rankClass(val, topVals) {
+  if (val === topVals[0]) return 'rank-1';
+  if (val === topVals[1]) return 'rank-2';
+  if (val === topVals[2]) return 'rank-3';
+  return '';
+}
+
+function fmt(v) { return v.toFixed(2); }
+
+// ── SCENARIO TABLE ────────────────────────────────────────────────────────────
+function renderScenario() {
+  const data = SCENARIO[curBackbone];
+  const rows = METHODS.map(m => {
+    const vals = data[m.id];
+    const a = avg(vals);
+    return { m, vals, avg: a };
+  });
+
+  // Compute column tops
+  const colTops = [];
+  for (let c = 0; c < 8; c++) {
+    const colVals = rows.map(r => r.vals[c]);
+    colTops.push(topN(colVals, 3));
+  }
+  const avgVals = rows.map(r => r.avg);
+  const avgTops = topN(avgVals, 3);
+
+  // Sort
+  rows.sort((a,b) => {
+    const av = sortCol < 10 ? a.vals[sortCol-2] : a.avg;
+    const bv = sortCol < 10 ? b.vals[sortCol-2] : b.avg;
+    return (bv - av) * sortDir;
+  });
+
+  const tbody = document.getElementById('scenario-body');
+  tbody.innerHTML = rows.map(({m, vals, avg: a}) => {
+    const hide = curFamily !== 'all' && m.fam !== curFamily;
+    const cells = vals.map((v,i) => {
+      const rc = rankClass(v, colTops[i]);
+      return `<td class="${rc}">${fmt(v)}</td>`;
+    });
+    const arc = rankClass(a, avgTops);
+    return `<tr class="${hide?'hidden':''}">
+      <td>${m.name}</td>
+      <td>${famTag(m.fam)}</td>
+      ${cells.join('')}
+      <td class="col-overall ${arc}"><strong>${fmt(a)}</strong></td>
+    </tr>`;
+  }).join('');
+
+  // Update sort icons
+  document.querySelectorAll('#scenario-table thead th').forEach((th, i) => {
+    th.classList.toggle('sorted', i === sortCol);
+    const icon = th.querySelector('.sort-icon');
+    if (icon) icon.textContent = i === sortCol ? (sortDir < 0 ? '↓' : '↑') : '↕';
+  });
+}
+
+// ── DATASET TABLE ─────────────────────────────────────────────────────────────
+function renderDataset() {
+  const data = DATASETS[curDsBackbone];
+  const visibleCols = curDsGroup === 'all' ? DS_COLS : DS_COLS.filter(c => c.group === curDsGroup);
+
+  // Header
+  const head = document.getElementById('dataset-head');
+  head.innerHTML = `<tr>
+    <th onclick="sortDsTable(0)">Method <span class="sort-icon">↕</span></th>
+    <th onclick="sortDsTable(1)">Access <span class="sort-icon">↕</span></th>
+    ${visibleCols.map((c,i) => `<th onclick="sortDsTable(${i+2})">${c.label} <span class="sort-icon">↕</span></th>`).join('')}
+    <th class="col-overall" onclick="sortDsTable(${visibleCols.length+2})">Avg. <span class="sort-icon">↕</span></th>
+  </tr>`;
+
+  const colIdxMap = visibleCols.map(c => DS_COLS.indexOf(c));
+
+  const rows = METHODS.map(m => {
+    const allVals = data[m.id];
+    const visVals = colIdxMap.map(i => allVals[i]);
+    const a = avg(visVals);
+    return { m, visVals, avg: a };
+  });
+
+  // Column tops
+  const colTops = visibleCols.map((_,ci) => {
+    const vals = rows.map(r => r.visVals[ci]);
+    return topN(vals, 3);
+  });
+  const avgTops = topN(rows.map(r => r.avg), 3);
+
+  // Sort
+  const totalCols = visibleCols.length + 2;
+  rows.sort((a, b) => {
+    let av, bv;
+    if (dsSortCol <= 1) {
+      av = a.m.name; bv = b.m.name;
+      return dsSortDir < 0 ? av.localeCompare(bv) : bv.localeCompare(av);
+    } else if (dsSortCol >= totalCols) {
+      av = a.avg; bv = b.avg;
+    } else {
+      av = a.visVals[dsSortCol-2]; bv = b.visVals[dsSortCol-2];
+    }
+    return (bv - av) * dsSortDir;
+  });
+
+  const tbody = document.getElementById('dataset-body');
+  tbody.innerHTML = rows.map(({m, visVals, avg: a}) => {
+    const hide = curDsFamily !== 'all' && m.fam !== curDsFamily;
+    const cells = visVals.map((v,i) => {
+      const rc = rankClass(v, colTops[i]);
+      return `<td class="${rc}">${fmt(v)}</td>`;
+    });
+    const arc = rankClass(a, avgTops);
+    return `<tr class="${hide?'hidden':''}">
+      <td>${m.name}</td>
+      <td>${famTag(m.fam)}</td>
+      ${cells.join('')}
+      <td class="col-overall ${arc}"><strong>${fmt(a)}</strong></td>
+    </tr>`;
+  }).join('');
+
+  // Update sort icons
+  document.querySelectorAll('#dataset-table thead th').forEach((th,i) => {
+    th.classList.toggle('sorted', i === dsSortCol);
+    const icon = th.querySelector('.sort-icon');
+    if (icon) icon.textContent = i === dsSortCol ? (dsSortDir < 0 ? '↓' : '↑') : '↕';
+  });
+}
+
+// ── CONTROLLERS ───────────────────────────────────────────────────────────────
+function showTab(name) {
+  ['scenario','dataset','submit'].forEach(t => {
+    document.getElementById('tab-'+t).classList.toggle('active', t===name);
+  });
+  document.querySelectorAll('.tab-btn').forEach((b,i) => {
+    b.classList.toggle('active', ['scenario','dataset','submit'][i]===name);
+  });
+  if (name === 'dataset') renderDataset();
+}
+
+function setBackbone(bb) {
+  curBackbone = bb;
+  document.querySelectorAll('#bb-btns .ctrl-btn').forEach((b,i) => {
+    b.classList.toggle('active', ['llama31','llama32','qwen8','qwen14'][i]===bb);
+  });
+  renderScenario();
+}
+
+function setFamily(fam) {
+  curFamily = fam;
+  ['all','bb','gb','wb'].forEach(f => {
+    document.getElementById('fam-'+f).classList.toggle('active', f===fam);
+  });
+  renderScenario();
+}
+
+function setDsBackbone(bb) {
+  curDsBackbone = bb;
+  document.querySelectorAll('#ds-bb-btns .ctrl-btn').forEach((b,i) => {
+    b.classList.toggle('active', ['llama31','llama32','qwen8','qwen14'][i]===bb);
+  });
+  renderDataset();
+}
+
+function setDsFamily(fam) {
+  curDsFamily = fam;
+  ['all','bb','gb','wb'].forEach(f => {
+    document.getElementById('ds-fam-'+f).classList.toggle('active', f===fam);
+  });
+  renderDataset();
+}
+
+function setDsGroup(g) {
+  curDsGroup = g;
+  dsSortCol = DS_COLS.filter(c => g==='all'||c.group===g).length + 2;
+  dsSortDir = -1;
+  document.querySelectorAll('.ds-tab').forEach((b,i) => {
+    b.classList.toggle('active', ['all','qa','rag','sum','math','sci','code','agent','multi'][i]===g);
+  });
+  renderDataset();
+}
+
+function sortTable(tableId, col) {
+  if (sortCol === col) sortDir *= -1;
+  else { sortCol = col; sortDir = -1; }
+  renderScenario();
+}
+
+function sortDsTable(col) {
+  if (dsSortCol === col) dsSortDir *= -1;
+  else { dsSortCol = col; dsSortDir = -1; }
+  renderDataset();
+}
+
+// ── INIT ──────────────────────────────────────────────────────────────────────
+renderScenario();
+</script>
+</body>
+</html>
