@@ -47,10 +47,11 @@ Hallucination detection is critical for the reliable deployment of large languag
 - **17 datasets** spanning QA (multiple-choice, open-ended, reading comprehension, multi-hop, conversational, grounded), RAG, summarization, mathematical reasoning, scientific reasoning, code generation, agentic tool use, and multilingual evaluation
 - **16 detectors** across three model-access regimes (black-box / gray-box / white-box)
 - **5 backbone LLMs** from the Llama and Qwen families (3B to 70B)
+- **Run from the command line** — pick datasets, backbones, and detectors with simple flags; no need to edit source files
 - **Unified instance schema** that normalizes heterogeneous task formats into a common structured representation
 - **GPT-4o-mini annotation** for scalable, reference-grounded truthfulness labeling
 - **AUROC** as the primary metric; **Cost@N** for efficiency analysis
-- **Resumable pipeline** with stage-level caching — expensive GPU steps are skipped automatically when artifacts already exist
+- **Resumable pipeline** with stage-level caching. Expensive GPU steps are skipped automatically when artifacts already exist
 
 ---
 
@@ -89,7 +90,17 @@ OPENAI_BASE_URL="https://api.openai.com/v1"
 
 ## 🔄 Pipeline Overview
 
-The benchmark runs in two independent phases:
+The benchmark runs in two independent phases — two commands end to end:
+
+```bash
+# Phase 1 — prepare data (structuring + generation + annotation)
+python datasets_v1/generate_pipeline.py --dataset triviaqa --model meta-llama/Llama-3.2-3B-Instruct --max_samples 100
+
+# Phase 2 — run detectors and report AUROC
+python baseline_detectors/runner.py --models meta-llama/Llama-3.2-3B-Instruct --datasets triviaqa --baselines mind prism perplexity
+```
+
+What each phase does:
 
 ```
 Phase 1 — Data Preparation (datasets_v1/)
@@ -114,39 +125,26 @@ Phase 2 — Detector Evaluation (baseline_detectors/)
 
 ## 📦 Step 1: Data Preparation
 
-Edit the configuration block at the top of `datasets_v1/generate_pipeline.py`:
-
-```python
-CONFIG = {
-    "dataset_name":   "ragtruth",                         # Dataset name (see supported list below)
-    "dataset_split":  "train",
-    "max_samples":    10000,
-
-    "target_model":   "meta-llama/Llama-3.2-3B-Instruct", # Backbone LLM
-    "system_prompt":  "You are a helpful, accurate, and honest AI assistant.",
-    "num_shots":      4,
-    "max_new_tokens": 2048,
-
-    "model_kwargs":   {"trust_remote_code": True, "attn_implementation": "sdpa"},
-    "generation_kwargs": {"do_sample": False},
-    "template_kwargs":   {"enable_thinking": False},
-
-    "layer_config":   {"mode": "middle", "count": 5},     # Hidden-state layer selection
-    "token_config":   {"mode": "backward", "count": 5},   # Token position selection
-
-    "judge_model":    "gpt-4o-mini",
-    "judge_concurrency": 2,
-
-    "base_output_dir": "./experiments"
-}
-```
-
-Then run the three-stage pipeline:
+Run the three-stage data pipeline (dataset structuring → LLM generation + hidden-state extraction → LLM-judge annotation) with a single command:
 
 ```bash
 cd datasets_v1
-python generate_pipeline.py
+python generate_pipeline.py --dataset triviaqa --model meta-llama/Llama-3.2-3B-Instruct --max_samples 100
 ```
+
+Common flags:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dataset` | `ragtruth` | Dataset name / adapter key (see supported list below) |
+| `--model` | `meta-llama/Llama-3.2-3B-Instruct` | Backbone LLM (any HF `AutoModelForCausalLM` id) |
+| `--max_samples` | `10000` | Maximum number of samples to process |
+| `--split` | `train` | Dataset split to load |
+| `--num_shots` | `4` | Number of few-shot demonstrations |
+| `--judge_model` | `gpt-4o-mini` | LLM-judge model for annotation |
+| `--output_dir` | `./experiments` | Base directory for generated artifacts |
+
+> Running `python generate_pipeline.py` with no flags reproduces the default configuration. For advanced options (hidden-state layer/token selection, decoding kwargs, etc.), edit the `CONFIG` block at the top of `generate_pipeline.py`.
 
 This produces the following artifacts under `experiments/<model>/<dataset>_<N>samples/`:
 
@@ -164,52 +162,26 @@ The pipeline is **resumable** — each stage checks for existing output files an
 
 ## 🚀 Step 2: Running the Benchmark
 
-Edit the bottom of `baseline_detectors/runner.py` to select your models, datasets, and detectors:
-
-```python
-if __name__ == "__main__":
-    set_global_seed(42)
-    run_benchmark(
-        target_models=[
-            "meta-llama/Llama-3.2-3B-Instruct",
-            "Qwen/Qwen3-8B",
-        ],
-        datasets=[
-            "triviaqa",
-            "gsm8k",
-            "humaneval",
-        ],
-        baselines=[
-            # Black-box
-            "verbalize",
-            "selfcheck_bertscore",
-            "selfcheck_nli",
-            "lexical_similarity",
-            # Gray-box
-            "perplexity",
-            "self_evaluator",
-            "ln_entropy",
-            "sar",
-            "semantic_entropy",
-            # White-box
-            "eigenscore_internal",
-            "ccs",
-            "haloscope",
-            "saplma",
-            "mind",
-            "sep",
-            "icr_probe",
-            "prism",
-        ]
-    )
-```
-
-Then run:
+Select your backbones, datasets, and detectors with command-line flags:
 
 ```bash
 cd baseline_detectors
-python runner.py
+python runner.py \
+  --models meta-llama/Llama-3.2-3B-Instruct Qwen/Qwen3-8B \
+  --datasets triviaqa gsm8k humaneval \
+  --baselines verbalize perplexity mind prism
 ```
+
+Common flags:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--models` | `Qwen/Qwen3-14B` | One or more backbone LLM ids (space-separated) |
+| `--datasets` | `belebele` | One or more dataset keys (space-separated) |
+| `--baselines` | *(all detectors)* | One or more detector registry keys; omit to run all 16+ detectors |
+| `--seed` | `42` | Global random seed |
+
+> Running `python runner.py` with no flags reproduces the default run configuration. Detector registry keys are listed in the [Supported Detectors](#-supported-detectors) section below.
 
 Results (AUROC per detector per dataset) are saved to `experiments/<model>/<dataset>/benchmark_results/`.
 
