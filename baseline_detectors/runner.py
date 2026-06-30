@@ -517,29 +517,54 @@ def run_benchmark(target_models: list, datasets: list, baselines: list):
             for h in qa_h5_handles.values(): h.close()
 
 
+DEFAULT_MODELS = ["Qwen/Qwen3-14B"]
+DEFAULT_DATASETS = ["belebele"]
+DEFAULT_BASELINES = [
+    "selfcheck_bertscore",
+    "selfcheck_nli",
+    "semantic_entropy",
+    "lexical_similarity",
+    "verbalize",
+    "self_evaluator",
+    "perplexity",
+    "ln_entropy",
+    "eigenscore_internal",
+    "ccs",
+    "prism",
+    "saplma",
+    "sep",
+    "icr_probe",
+    "mind",
+    "sar",
+    "haloscope",
+    "tsv",
+]
+
+
+def parse_args():
+    """Parse command-line overrides. With no arguments, the defaults below
+    reproduce the original hard-coded run configuration."""
+    import argparse
+    p = argparse.ArgumentParser(
+        description="OpenHalDet — Phase 2: detector evaluation. "
+                    "Select backbones, datasets, and detectors to benchmark under a unified protocol."
+    )
+    p.add_argument("--models", nargs="+", default=DEFAULT_MODELS,
+                   help="One or more backbone LLM ids (space-separated).")
+    p.add_argument("--datasets", nargs="+", default=DEFAULT_DATASETS,
+                   help="One or more dataset keys (space-separated).")
+    p.add_argument("--baselines", nargs="+", default=DEFAULT_BASELINES,
+                   help="One or more detector registry keys (space-separated). "
+                        "Omit to run all supported detectors.")
+    p.add_argument("--seed", type=int, default=42, help="Global random seed.")
+    return p.parse_args()
+
+
 if __name__ == "__main__":
-    set_global_seed(42)
+    args = parse_args()
+    set_global_seed(args.seed)
     run_benchmark(
-        target_models=["Qwen/Qwen3-14B"],
-        datasets=["belebele"],
-        baselines=[
-            "selfcheck_bertscore",
-            "selfcheck_nli",
-            "semantic_entropy",
-            "lexical_similarity",
-            "verbalize",
-            "self_evaluator",
-            "perplexity",
-            "ln_entropy",
-            "eigenscore_internal",
-            "ccs",
-            "prism",
-            "saplma",
-            "sep",
-            "icr_probe",
-            "mind",
-            "sar",
-            "haloscope",
-            "tsv"
-        ]
+        target_models=args.models,
+        datasets=args.datasets,
+        baselines=args.baselines,
     )
