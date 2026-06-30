@@ -61,9 +61,10 @@ Hallucination detection is critical for the reliable deployment of large languag
 
 - Python 3.9+
 - CUDA-capable GPU (recommended: NVIDIA H100 / H800 / A100)
+- A Hugging Face account (to download backbone models)
 - An OpenAI API key (for GPT-4o-mini annotation in Step 1)
 
-### Install dependencies
+### 1. Clone and install dependencies
 
 ```bash
 git clone https://github.com/Nellie179/Hallucination-Detection.git
@@ -71,20 +72,30 @@ cd Hallucination-Detection
 pip install -r requirements.txt
 ```
 
-### Configure API keys
+### 2. Log in to Hugging Face
 
-Create a `.env` file under `datasets_v1/` (a template is provided):
+Backbone models are downloaded from the Hugging Face Hub. Log in once from your terminal so the download has access to your account:
 
 ```bash
-cp datasets_v1/.env.example datasets_v1/.env
+huggingface-cli login
 ```
 
-Then fill in your key:
+Paste an access token when prompted (create one at <https://huggingface.co/settings/tokens>).
+
+> **Gated models (Llama family).** Llama-3.x checkpoints require one-time access approval. Open the model page (e.g. <https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct>) and click **Request access** before downloading; approval is usually quick. **Qwen3 models (Apache 2.0) are not gated** and work immediately after login, so they are the easiest choice to get started.
+
+### 3. Set your OpenAI API key
+
+Step 1 uses `gpt-4o-mini` to annotate responses, so an OpenAI API key is required (create one at <https://platform.openai.com/api-keys>; this stage makes paid API calls).
+
+Create a file at `datasets_v1/.env` and add:
 
 ```
 OPENAI_API_KEY=your_openai_key_here
 OPENAI_BASE_URL="https://api.openai.com/v1"
 ```
+
+> Keep this file private. Add `.env` to your `.gitignore` so your key is never committed.
 
 ---
 
