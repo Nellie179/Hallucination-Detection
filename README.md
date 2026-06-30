@@ -328,14 +328,12 @@ Hallucination-Detection/
 │   │   ├── mind.py
 │   │   ├── sep.py
 │   │   ├── icr_probe.py
-│   │   ├── prism.py
-│   │   └── tsv.py
+│   │   └── prism.py
 │   │
 │   ├── data_utils/                     # Shared utilities for detectors
 │   │   ├── accessor.py                 # SampleAccessor (unified data loader)
 │   │   ├── data_split.py               # Stratified 60/20/20 train/val/test split
 │   │   ├── extract_qa_hidden_states.py # White-box feature extraction
-│   │   ├── extract_tsv_features.py     # TSV feature extraction
 │   │   ├── icr_score.py                # ICR attention/residual scoring
 │   │   ├── labels.py                   # Label parsing utilities
 │   │   ├── llm_layers.py               # Layer selection helpers

@@ -536,8 +536,7 @@ DEFAULT_BASELINES = [
     "icr_probe",
     "mind",
     "sar",
-    "haloscope",
-    "tsv",
+    "haloscope"
 ]
 
 
