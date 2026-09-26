@@ -389,31 +389,9 @@ AUROC (%) aggregated by scenario on Llama and Qwen backbones. See the paper for 
 2. **More model access does not guarantee better detection.** Gray-box methods are competitive with white-box methods despite requiring only token probabilities.
 3. **Evidence acquisition dominates practical cost.** Sampling-based detectors are significantly more expensive; accuracy-only comparisons are incomplete.
 
----
-
-## 📖 Citation
-
-If you use OpenHalDet in your research, please cite:
-
-```bibtex
-@article{li2026openhaldet,
-  title     = {OpenHalDet: A Unified Benchmark for Hallucination Detection across Diverse Generation Scenarios},
-  author    = {Li, Xinyi and Fang, Zhen and Deng, Yongxin and Luo, Jinyuan and Ma, Hongnan and
-               Oh, Changdae and Shi, Zijing and Ye, Shanshan and Wang, Hanchen and Chen, Shu-Lin and
-               Luo, Yadan and Yang, Mengyue and Du, Sean and Li, Sharon and Chen, Ling},
-  journal   = {arXiv preprint arXiv:2606.06959},
-  year      = {2026}
-}
-```
 
 ---
 
 ## 📄 License
 
 This project is released under the [MIT License](LICENSE). Note that individual datasets and backbone models are subject to their own licenses — please refer to the original sources before use. Key third-party licenses include the Llama 3 Community License (Meta), Apache 2.0 (Qwen3), and various dataset-specific terms summarized in the paper's Appendix L.
-
----
-
-## 🙏 Acknowledgements
-
-We thank the authors of all baseline detectors and benchmark datasets included in OpenHalDet. This work was supported by researchers at the University of Technology Sydney, University of Wisconsin–Madison, University of Bristol, The University of Queensland, and Nanyang Technological University.
