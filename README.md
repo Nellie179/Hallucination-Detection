@@ -1,8 +1,6 @@
 # OpenHalDet: A Unified Benchmark for Hallucination Detection across Diverse Generation Scenarios
 
 <p align="center">
-  <a href="https://arxiv.org/abs/2606.06959"><img src="https://img.shields.io/badge/arXiv-2606.06959-b31b1b.svg" alt="arXiv"></a>
-  <a href="https://github.com/Nellie179/Hallucination-Detection"><img src="https://img.shields.io/badge/GitHub-Hallucination--Detection-blue?logo=github" alt="GitHub"></a>
   <img src="https://img.shields.io/badge/Python-3.9%2B-blue" alt="Python">
   <img src="https://img.shields.io/badge/PyTorch-2.x-orange" alt="PyTorch">
   <img src="https://img.shields.io/badge/License-MIT-green" alt="License">
@@ -67,7 +65,7 @@ Hallucination detection is critical for the reliable deployment of large languag
 ### 1. Clone and install dependencies
 
 ```bash
-git clone https://github.com/Nellie179/Hallucination-Detection.git
+git clone url
 cd Hallucination-Detection
 pip install -r requirements.txt
 ```
